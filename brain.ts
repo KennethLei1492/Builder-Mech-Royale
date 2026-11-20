@@ -62,6 +62,26 @@ const UPGRADE_SCORE: Record<string, number> = {
   mortar_velocity: 2,
 }
 
+/** tunables (overridable for local experiments via MF_TUNE='{"k":v}') */
+export const TUNE: Record<string, number> = {
+  retreatHp1: 0.3, // alone-ish: retreat below this hp fraction if the enemy is healthier
+  retreat3: 0.75, // 3+ engaged
+  retreat2: 0.5, // 2+ engaged
+  powerRatio: 0.5,
+  noRetreat: 1,
+  rangeGun: 55,
+  rangeLightning: 24,
+  rangeLaser: 85,
+  regenHp: 0.85,
+  grabDist: 50,
+  hpWeight: 70,
+  zapReserve: 6,
+}
+try {
+  const env = (globalThis as any).process?.env?.MF_TUNE
+  if (env) Object.assign(TUNE, JSON.parse(env))
+} catch {}
+
 export function createBot(hello: Hello): Bot {
   return new Brain(hello)
 }
@@ -269,7 +289,7 @@ export class Brain implements Bot {
       const d = hyp2(this.px, this.py, tr.pos[0], tr.pos[1])
       if (d > 280) continue
       const los = this.canHit(tr)
-      let s = d + (tr.hp / Math.max(1, tr.maxHp)) * 70
+      let s = d + (tr.hp / Math.max(1, tr.maxHp)) * TUNE.hpWeight
       if (!los) s += 220
       if (this.t - tr.lastHitMeT < 2) s -= 35
       if (tr.id === this.targetId) s -= 30
@@ -472,8 +492,16 @@ export class Brain implements Bot {
       const zw = me.weapons[zs]!
       const range = zw.stats.range ?? 45
       const cone = ((zw.stats.cone_deg ?? 30) * Math.PI) / 180 / 2
-      const reserve = this.mode === "retreat" ? 25 : 6
-      if (d < range - 1 && angDiff(curYaw, direct[0]) < cone * 0.85 && me.energy >= (zw.stats.energy ?? 3) + reserve && zw.cooldown <= 0.1) fire[zs] = true
+      const reserve = this.mode === "retreat" ? 25 : TUNE.zapReserve
+      let zapOk = d < range - 1 && angDiff(curYaw, direct[0]) < cone * 0.85
+      if (!zapOk)
+        for (const e of this.enemies(0.15, range - 1)) {
+          if (angDiff(curYaw, yawTo(this.px, this.py, e.pos[0], e.pos[1])) < cone * 0.85 && this.canHit(e)) {
+            zapOk = true
+            break
+          }
+        }
+      if (zapOk && me.energy >= (zw.stats.energy ?? 3) + reserve && zw.cooldown <= 0.1) fire[zs] = true
       if (d < range + 8) {
         // lightning doesn't care about lead; aim straight when it's the main weapon up close
         if (!gw || (gw.reload ?? 0) > 0) {
@@ -645,17 +673,18 @@ export class Brain implements Bot {
     if (eng.length >= 1) {
       const weakest = eng.reduce((a, b) => (a.hp < b.hp ? a : b))
       const finishing = eng.length <= 2 && weakest.hp < 260 && me.hp > 350 && hyp2(this.px, this.py, weakest.pos[0], weakest.pos[1]) < 90
-      if (hpf < 0.3 && (eng.length >= 2 || eng[0].hp > me.hp * 1.1)) retreat = true
-      if (eng.length >= 3 && hpf < 0.75) retreat = true
-      if (eng.length >= 2 && hpf < 0.5) retreat = true
-      if (myPower < enemyPower * 0.5) retreat = true
+      if (hpf < TUNE.retreatHp1 && (eng.length >= 2 || eng[0].hp > me.hp * 1.1)) retreat = true
+      if (eng.length >= 3 && hpf < TUNE.retreat3) retreat = true
+      if (eng.length >= 2 && hpf < TUNE.retreat2) retreat = true
+      if (myPower < enemyPower * TUNE.powerRatio) retreat = true
       if (finishing && eng.length === 1) retreat = false
+      if (TUNE.noRetreat) retreat = false
     } else if (t - this.lastDamageT < 1.5 && hpf < 0.35 && this.lastDamageBy !== null) retreat = true
     if (retreat) mode = "retreat"
     else if (eng.length) mode = "fight"
     else if (near.length) mode = "avoid"
     else if (zoneUrgent) mode = "zone"
-    else if (hpf < 0.85 && t - this.lastDamageT < 30) mode = "regen"
+    else if (hpf < TUNE.regenHp && t - this.lastDamageT < 30) mode = "regen"
     else mode = "patrol"
     if ((mode === "fight" || mode === "avoid") && zoneUrgent && !me.in_zone) mode = "zone"
     if (this.mode === "retreat" && mode !== "retreat" && t - this.modeSince < 1.5 && near.length) mode = "retreat"
@@ -805,6 +834,14 @@ export class Brain implements Bot {
         break
       }
     }
+    // grab cubes (and wanted weapons) that are close, whatever we're doing
+    if (this.mode === "fight" || this.mode === "avoid" || this.mode === "regen" || this.mode === "retreat") {
+      const grab = this.nearGrab(obs)
+      if (grab) {
+        goal = grab
+        this.dbg.push("grab")
+      }
+    }
     // dodging shells
     for (const s of this.shells) {
       const d = hyp2(this.px, this.py, s.x, s.y)
@@ -856,10 +893,10 @@ export class Brain implements Bot {
     const hasL = this.slotOf("lightning") >= 0 && this.me.energy > 12
     const hasLaser = this.slotOf("laser") >= 0
     const hasGun = this.slotOf("gun") >= 0
-    if (hasL) return 24
+    if (hasL) return TUNE.rangeLightning
     if (hasLaser && !hasGun) return 120
-    if (hasLaser) return 85
-    return 55
+    if (hasLaser) return TUNE.rangeLaser
+    return TUNE.rangeGun
   }
 
   /** a nearby walkable point out of every known enemy's sight, inside the safe circle */
@@ -981,6 +1018,28 @@ export class Brain implements Bot {
       if (best) return best
     }
     return null
+  }
+
+  nearGrab(obs: Observation): number[] | null {
+    let best: number[] | null = null
+    let bd = TUNE.grabDist
+    const ok = (x: number, y: number, z: number) => z <= this.W.floorAt(x, y) + 2.5 && this.W.walkable(this.px, this.py, x, y, this.radius)
+    for (const c of obs.cubes) {
+      const d = hyp2(this.px, this.py, c.pos[0], c.pos[1])
+      if (d < bd && ok(c.pos[0], c.pos[1], c.pos[2])) {
+        bd = d
+        best = [c.pos[0], c.pos[1]]
+      }
+    }
+    for (const p of obs.pickups) {
+      if (this.badPickups.has(p.id) || this.loadoutGain(p.kind).gain < 0.5) continue
+      const d = hyp2(this.px, this.py, p.pos[0], p.pos[1])
+      if (d < bd && ok(p.pos[0], p.pos[1], p.pos[2])) {
+        bd = d
+        best = [p.pos[0], p.pos[1]]
+      }
+    }
+    return best
   }
 
   lootGoal(obs: Observation, sc: number[]): number[] | null {

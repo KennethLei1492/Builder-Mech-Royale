@@ -16,6 +16,7 @@ import { draw } from "./mechfight.ts"
 import { angDiff, clamp, hyp2, mulberry32, wrap, yawTo } from "./util.ts"
 import { getWorld, type World } from "./world.ts"
 import { chooseTactic } from "./model.ts"
+import { imitationFeatures, valueChoice, type ImitEnemy } from "./imitate.ts"
 
 type Track = {
   id: number
@@ -85,7 +86,7 @@ export const TUNE: Record<string, number> = {
   laserGrab: 300,
   kite: 130,
   kiteMin: 30,
-  farmHp: 0.5,
+  farmHp: 0.9,
   dropDist: 0,
   cubeValue: 100,
   cubeRun: 0,
@@ -133,6 +134,15 @@ export const TUNE: Record<string, number> = {
   treePosts: 0,
   farmClear: 200,
   openFarm: 0,
+  droneDefense: 1,
+  lootHurt: 0,
+  paceHp: 0,
+  paceT: 0,
+  paceWindow: 60,
+  isolate: 0,
+  isoRecalc: 0.6,
+  lobUnseen: 0,
+  imitMove: 0,
   exploreAvoid: 0,
   laserTarget: 0,
   budgetPath: 12,
@@ -205,6 +215,9 @@ export class Brain implements Bot {
   hitWindow: { t: number; amt: number }[] = []
   unseenT = -99
   myKills = 0
+  npcHitT = -99
+  npcBearing = 0
+  lastKillT = -99
   /** free-for-all detected: mechs are dying without us (against the house squad they only die to us) */
   ffa = false
   /** FFA and still crowded: lie low, let the others thin each other out, third-party the weak */
@@ -419,9 +432,14 @@ export class Brain implements Bot {
             }
           }
         }
+        if (e.weapon === "npc") {
+          this.npcHitT = t
+          if (e.bearing !== null) this.npcBearing = e.bearing
+        }
         this.dmgWindow.push({ t, amt: e.amount })
       } else if (e.type === "kill") {
         this.myKills++
+        this.lastKillT = t
         const dead = this.tracks.get(e.target)
         if (dead) this.memCubes.set(-5000 - e.target, { id: -1, pos: dead.pos, t })
         if (dead) for (const k of dead.weapons) if (k !== "gun") this.memPickups.set(-1000 - e.target * 4 - this.memPickups.size, { id: -1, kind: k, pos: dead.pos, t })
@@ -536,8 +554,24 @@ export class Brain implements Bot {
 
   /** NPC or crate to farm when no mech is around */
   farmTarget(obs: Observation): { pos: number[]; id: number; kind: "npc" | "crate"; hp: number } | null {
+    if (this.T.droneDefense && this.t - this.npcHitT < 3) {
+      // a drone is shooting us: kill it (it keeps chasing whoever attacked it)
+      let best: ActorObs | null = null
+      let bd = 1e9
+      for (const m of obs.mechs) {
+        if (m.kind !== "npc") continue
+        const d = hyp2(this.px, this.py, m.pos[0], m.pos[1])
+        const tr = this.tracks.get(m.id)
+        if (tr && d < bd && this.canHit(tr)) {
+          bd = d
+          best = m
+        }
+      }
+      if (best) return { pos: best.pos, id: best.id, kind: "npc", hp: best.hp ?? 350 }
+    }
     if (this.enemies(1.5, this.T.farmClear).length) return null
     if (this.me.hp < this.me.max_hp * this.T.farmHp) return null
+    if (this.pacing()) return null
     let best: { pos: number[]; id: number; kind: "npc" | "crate"; hp: number } | null = null
     let bd = 1e9
     for (const m of obs.mechs) {
@@ -668,11 +702,35 @@ export class Brain implements Bot {
         // release into the last known enemy direction rather than wasting the charge randomly
         fire[ls] = (lw.charge ?? 0) < (lw.stats.charge ?? 0.75) + (lw.stats.hold_s ?? 2) - 0.3
       }
+      // artillery: lob mortar shells over cover at a mech we know about but cannot hit directly
+      const mo = this.slotOf("mortar")
+      if (this.T.lobUnseen && mo >= 0 && me.weapons[mo]!.cooldown <= 0.1) {
+        let tr: Track | null = null
+        let bd = 1e9
+        for (const e of this.tracks.values()) {
+          if (e.kind !== "mech" || this.t - e.seenT > this.T.lobUnseen) continue
+          const d = hyp2(this.px, this.py, e.pos[0], e.pos[1])
+          if (d > 30 && d < 225 && d < bd) {
+            bd = d
+            tr = e
+          }
+        }
+        if (tr) {
+          const sol = this.mortarAim(tr.pos, tr.vel, me.weapons[mo]!.stats)
+          if (sol) {
+            a.aim = [sol[0], sol[1]]
+            if (angDiff(me.aim[0], sol[0]) < 0.03 && Math.abs(me.aim[1] - sol[1]) < 0.03) fire[mo] = true
+            this.dbg.push("lob")
+            return true
+          }
+        }
+      }
       return false
     }
     const d = hyp2(this.px, this.py, tgt.pos[0], tgt.pos[1])
     if (this.mode === "avoid" && !this.healthyToSnipe() && !(lw && (lw.charge ?? 0) > 0)) return false
     if (this.ffaQuiet && this.mode === "avoid" && tgt.isMech && (tgt.tr?.hp ?? 9999) > this.T.ffaSnipeHp && !(lw && (lw.charge ?? 0) > 0)) return false
+    if (this.pacing() && this.mode === "avoid" && tgt.isMech && !(lw && (lw.charge ?? 0) > 0)) return false
     if (this.survivorOn() && tgt.isMech && tgt.tr && this.t - tgt.tr.lastHitMeT > this.T.survHit && d > this.T.survClose && !(lw && (lw.charge ?? 0) > 0)) return false
     if (this.mode === "avoid" && tgt.isMech && d > this.T.avoidFire && !(lw && (lw.charge ?? 0) > 0)) {
       // not engaged yet: only the laser snipes (outranges everything), the gun stays quiet
@@ -911,6 +969,12 @@ export class Brain implements Bot {
     return this.me.hp >= this.me.max_hp * this.T.snipeHp && this.enemies(0.5, 220).length <= this.T.snipeMaxVis
   }
   /** enemies that are actually on us: hit us recently or are close */
+  /** kill pacing: each kill releases another hunter; heal before starting the next fight */
+  pacing(): boolean {
+    if (!this.T.paceHp && !this.T.paceT) return false
+    if (this.T.paceT && this.t - this.lastKillT < this.T.paceT) return true
+    return !!this.T.paceHp && this.me.hp < this.me.max_hp * this.T.paceHp && this.t - this.lastKillT < this.T.paceWindow
+  }
   /** survivor strategy: never start fights (every kill releases more hunters); outlast the squad instead */
   survivorOn(): boolean {
     return !!this.T.survivor && this.t < this.T.survUntil
@@ -920,6 +984,10 @@ export class Brain implements Bot {
     for (const e of this.enemies(0.5, maxD)) {
       const d = hyp2(this.px, this.py, e.pos[0], e.pos[1])
       const closing = (e.vel[0] * (this.px - e.pos[0]) + e.vel[1] * (this.py - e.pos[1])) / Math.max(1, d) > 4
+      if (this.pacing()) {
+        if (this.t - e.lastHitMeT < 6 || d < 50) out.push(e)
+        continue
+      }
       if (this.survivorOn()) {
         if (this.t - e.lastHitMeT < this.T.survHit || d < this.T.survClose) out.push(e)
         continue
@@ -1196,6 +1264,12 @@ export class Brain implements Bot {
           this.strafeFlipT = t + this.T.strafeMin + this.rnd() * this.T.strafeVar
         }
         let radial = clamp((d - R) / Math.max(15, R * 0.5), -1, 1)
+        const iso = this.isolateGoal(tr)
+        if (iso) {
+          goal = iso
+          this.dbg.push("isolate")
+          break
+        }
         if (this.T.kite && this.slotOf("laser") >= 0) {
           let nd = 1e9
           for (const e of this.enemies(0.5, this.T.kite + 10)) nd = Math.min(nd, hyp2(this.px, this.py, e.pos[0], e.pos[1]))
@@ -1263,7 +1337,7 @@ export class Brain implements Bot {
             break
           }
         }
-        if (this.T.openPost && !this.ffaQuiet && !this.survivorOn() && (this.slotOf("laser") >= 0 || this.T.gunSniper > 0) && this.healthyToSnipe()) {
+        if (this.T.openPost && !this.ffaQuiet && !this.survivorOn() && !this.pacing() && (this.slotOf("laser") >= 0 || this.T.gunSniper > 0) && this.healthyToSnipe()) {
           // sniper: hold the open ground and keep our distance while the laser works
           for (const e of this.enemies(0.5, 160)) {
             const d = Math.max(5, hyp2(this.px, this.py, e.pos[0], e.pos[1]))
@@ -1288,6 +1362,11 @@ export class Brain implements Bot {
             const d = Math.max(5, hyp2(this.px, this.py, e.pos[0], e.pos[1]))
             ax += (this.px - e.pos[0]) / d / d
             ay += (this.py - e.pos[1]) / d / d
+          }
+          if (!ens.length && this.T.droneDefense && t - this.lastDamageT < 3) {
+            const b = t - this.npcHitT < 3 ? this.npcBearing : this.lastDamageBearing
+            ax = -Math.cos(b)
+            ay = -Math.sin(b)
           }
           const n = Math.hypot(ax, ay) || 1
           desire = [ax / n, ay / n]
@@ -1416,7 +1495,8 @@ export class Brain implements Bot {
       }
     }
     // a laser is worth a detour from anything but the zone
-    if (this.mode !== "zone" && this.slotOf("laser") < 0) {
+    const hurtWithEnemies = this.T.lootHurt && me.hp < me.max_hp * this.T.lootHurt && (this.engagedSet().length > 0 || this.mode === "retreat")
+    if (this.mode !== "zone" && this.slotOf("laser") < 0 && !hurtWithEnemies) {
       let bl: number[] | null = null
       let bd = this.T.laserGrab
       for (const p of this.memPickups.values()) {
@@ -1439,6 +1519,28 @@ export class Brain implements Bot {
       if (grab) {
         goal = grab
         this.dbg.push("grab")
+      }
+    }
+    // movement learned from the top-16 bots' real combat (outcome model), while enemies are in view
+    if (this.T.imitMove && (this.mode === "fight" || this.mode === "avoid" || this.mode === "retreat")) {
+      const act = this.imitAction(obs)
+      const tr = target ?? this.enemies(0.3, 250)[0]
+      if (act >= 0 && tr) {
+        const d = Math.max(1, hyp2(this.px, this.py, tr.pos[0], tr.pos[1]))
+        const ux = (tr.pos[0] - this.px) / d, uy = (tr.pos[1] - this.py) / d
+        if (t > this.strafeFlipT) {
+          this.strafeSign = this.rnd() < 0.5 ? -1 : 1
+          this.strafeFlipT = t + this.T.strafeMin + this.rnd() * this.T.strafeVar
+        }
+        goal = null
+        if (act === 0) desire = [0, 0]
+        else if (act === 1) goal = [tr.pos[0], tr.pos[1]]
+        else if (act === 2) {
+          const kp = this.kitePoint(sc)
+          if (kp) goal = kp
+          else desire = [-ux, -uy]
+        } else desire = [-uy * this.strafeSign, ux * this.strafeSign]
+        this.dbg.push("im" + act)
       }
     }
     // learned / explored tactic overrides the movement intent while enemies are around
@@ -1814,6 +1916,75 @@ export class Brain implements Bot {
       obs.t / 480, obs.alive / 16,
       target && this.canHit(target) ? 1 : 0,
     ]
+  }
+
+  imitA = -1
+  imitUntil = -99
+  imitAction(obs: Observation): number {
+    if (this.t < this.imitUntil) return this.imitA
+    const vis: ImitEnemy[] = []
+    for (const m of obs.mechs) {
+      if (m.kind !== "mech") continue
+      const tr = this.tracks.get(m.id)
+      vis.push({ x: m.pos[0], y: m.pos[1], z: m.pos[2], yaw: m.aim[0], hp: m.hp ?? 1400, maxHp: m.max_hp ?? 1400, hasLaser: (m.weapons ?? []).includes("laser"), charging: !!m.charging, hitMeRecently: !!tr && this.t - tr.lastHitMeT < 2 })
+    }
+    if (!vis.length) return -1
+    const z = this.zoneAt(obs.zone, this.t)
+    const me = this.me
+    const ls = this.slotOf("laser")
+    const { f } = imitationFeatures({
+      x: this.px, y: this.py, z: this.pz, hp: me.hp, maxHp: me.max_hp, energy: me.energy, cubes: me.cubes,
+      weapons: me.weapons.filter((w) => w).map((w) => w!.kind), charging: ls >= 0 && (me.weapons[ls]!.charge ?? 0) > 0,
+      taken3: this.dmgWindow.reduce((s, x) => s + x.amt, 0), dealt3: this.hitWindow.reduce((s, x) => s + x.amt, 0),
+      zone: z, t: this.t, alive: obs.alive,
+    }, vis, this.W)
+    this.imitA = valueChoice(f)
+    this.imitUntil = this.t + 0.5
+    return this.imitA
+  }
+
+  // ---- isolation (pro 1vX play): with 2+ enemies on us, stand where only one of them can shoot us
+  isoP: number[] | null = null
+  isoT = -99
+  isoTarget = -1
+  isolateGoal(target: Track): number[] | null {
+    if (!this.T.isolate) return null
+    const eng = this.engagedSet(220)
+    if (eng.length < 2) return null
+    if (this.isoP && this.isoTarget === target.id && this.t - this.isoT < this.T.isoRecalc && hyp2(this.px, this.py, this.isoP[0], this.isoP[1]) > 2) return this.isoP
+    if (this.busy(this.T.budgetSearch)) return this.isoP
+    this.isoT = this.t
+    this.isoTarget = target.id
+    const W = this.W
+    const sees = (e: Track, x: number, y: number, z: number) =>
+      W.ray(e.pos[0], e.pos[1], e.pos[2] + 7, x, y, z + 4.5, 1.5) >= 0.99 || W.ray(e.pos[0], e.pos[1], e.pos[2] + 7, x, y, z + 8, 1.5) >= 0.99
+    let best: number[] | null = null
+    let bs = 1e9
+    for (const r of [0, 5, 10, 16]) {
+      const n = r === 0 ? 1 : 12
+      for (let k = 0; k < n; k++) {
+        const a = (k / n) * Math.PI * 2
+        const x = this.px + Math.cos(a) * r, y = this.py + Math.sin(a) * r
+        if (r > 0 && (W.clearAt(x, y) < this.radius + 0.3 || !W.walkable(this.px, this.py, x, y, this.radius))) continue
+        const z = W.floorAt(x, y)
+        if (W.ray(x, y, z + this.muzzle, target.pos[0], target.pos[1], target.pos[2] + 4.5, 1.5) < 0.99) continue
+        let others = 0
+        for (const e of eng) if (e.id !== target.id && sees(e, x, y, z)) others++
+        const sc = others * 100 + r * 1.5
+        if (sc < bs) {
+          bs = sc
+          best = [x, y]
+        }
+      }
+    }
+    let othersHere = 0
+    for (const e of eng) if (e.id !== target.id && sees(e, this.px, this.py, this.pz)) othersHere++
+    if (!best || bs >= othersHere * 100) {
+      this.isoP = null
+      return null
+    }
+    this.isoP = best
+    return best
   }
 
   kiteT = -99

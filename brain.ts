@@ -140,6 +140,11 @@ export const TUNE: Record<string, number> = {
   gunMoveRange: 175,
   chaseFar: 0,
   regenExplore: 0,
+  regenLoot: 0,
+  laserFightD: 0,
+  kiteBoost: 40,
+  kiteBoostCharge: 0,
+  kiteGun: 0,
   seenRay: 0,
   roofMemFix: 0,
   crateAimFix: 1,
@@ -1060,6 +1065,8 @@ export class Brain implements Bot {
     else mode = "patrol"
     if ((mode === "fight" || mode === "avoid") && zoneUrgent && !me.in_zone) mode = "zone"
     // HP regenerates while walking too: without a laser, spend the regen time searching instead of sitting in cover
+    // same for loot we know about: walk to it while the HP comes back
+    if (mode === "regen" && this.T.regenLoot && this.lootGoal(obs, sc)) mode = "patrol"
     if (mode === "regen" && this.T.regenExplore && this.slotOf("laser") < 0 && this.wantsWeapons()) mode = "patrol"
     if (this.mode === "retreat" && mode !== "retreat" && t - this.modeSince < 1.5 && near.length) mode = "retreat"
     if (mode !== this.mode) {
@@ -1295,7 +1302,7 @@ export class Brain implements Bot {
           this.dbg.push("isolate")
           break
         }
-        if (this.T.kite && this.slotOf("laser") >= 0) {
+        if (this.T.kite && (this.slotOf("laser") >= 0 || (this.T.kiteGun && this.slotOf("gun") >= 0))) {
           let nd = 1e9
           for (const e of this.enemies(0.5, this.T.kite + 10)) nd = Math.min(nd, hyp2(this.px, this.py, e.pos[0], e.pos[1]))
           if (nd < this.T.kite && nd > this.T.kiteMin) {
@@ -1303,6 +1310,9 @@ export class Brain implements Bot {
             if (kp) {
               goal = kp
               this.dbg.push("kite")
+              // between laser shots, boost to open the gap again (charging halves our speed)
+              const lw0 = me.weapons[this.slotOf("laser")]
+              if (this.T.kiteBoost && me.energy > this.T.kiteBoost && (this.T.kiteBoostCharge || !((lw0?.charge ?? 0) > 0))) boost = true
               break
             }
           }
@@ -1546,6 +1556,7 @@ export class Brain implements Bot {
           if (contested) continue
         }
         const d = hyp2(this.px, this.py, p.pos[0], p.pos[1])
+        if (this.T.laserFightD && this.mode === "fight" && d > this.T.laserFightD) continue
         if (d < bd) {
           bd = d
           bl = [p.pos[0], p.pos[1]]

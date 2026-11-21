@@ -132,7 +132,14 @@ export const TUNE: Record<string, number> = {
   ffaMode: 0,
   treePosts: 0,
   farmClear: 200,
-  openFarm: 40,
+  openFarm: 0,
+  budgetPath: 12,
+  budgetSearch: 15,
+  pathExpand: 25000,
+  survivor: 0,
+  survUntil: 999,
+  survHit: 6,
+  survClose: 40,
   openFarmR: 150,
   beamPhantom: 0,
   roofLoot: 0,
@@ -242,7 +249,14 @@ export class Brain implements Bot {
   }
 
   // ======================================================================= main
+  /** start of the current decision (performance.now) */
+  t0 = 0
+  /** milliseconds used so far in this decision exceed `ms` (the server allows 50 on one slow CPU) */
+  busy(ms: number): boolean {
+    return performance.now() - this.t0 > ms
+  }
   act(obs: Observation): BotAction {
+    this.t0 = performance.now()
     this.T = this.tuneLocal ? { ...TUNE, ...this.tuneLocal } : TUNE
     this.t = obs.t
     this.tick = obs.tick
@@ -656,6 +670,7 @@ export class Brain implements Bot {
     const d = hyp2(this.px, this.py, tgt.pos[0], tgt.pos[1])
     if (this.mode === "avoid" && !this.healthyToSnipe() && !(lw && (lw.charge ?? 0) > 0)) return false
     if (this.ffaQuiet && this.mode === "avoid" && tgt.isMech && (tgt.tr?.hp ?? 9999) > this.T.ffaSnipeHp && !(lw && (lw.charge ?? 0) > 0)) return false
+    if (this.survivorOn() && tgt.isMech && tgt.tr && this.t - tgt.tr.lastHitMeT > this.T.survHit && d > this.T.survClose && !(lw && (lw.charge ?? 0) > 0)) return false
     if (this.mode === "avoid" && tgt.isMech && d > this.T.avoidFire && !(lw && (lw.charge ?? 0) > 0)) {
       // not engaged yet: only the laser snipes (outranges everything), the gun stays quiet
       const gunSnipe = this.T.gunSniper > 0 && !lw && d < this.T.gunSniper
@@ -893,11 +908,19 @@ export class Brain implements Bot {
     return this.me.hp >= this.me.max_hp * this.T.snipeHp && this.enemies(0.5, 220).length <= this.T.snipeMaxVis
   }
   /** enemies that are actually on us: hit us recently or are close */
+  /** survivor strategy: never start fights (every kill releases more hunters); outlast the squad instead */
+  survivorOn(): boolean {
+    return !!this.T.survivor && this.t < this.T.survUntil
+  }
   engagedSet(maxD = 130): Track[] {
     const out: Track[] = []
     for (const e of this.enemies(0.5, maxD)) {
       const d = hyp2(this.px, this.py, e.pos[0], e.pos[1])
       const closing = (e.vel[0] * (this.px - e.pos[0]) + e.vel[1] * (this.py - e.pos[1])) / Math.max(1, d) > 4
+      if (this.survivorOn()) {
+        if (this.t - e.lastHitMeT < this.T.survHit || d < this.T.survClose) out.push(e)
+        continue
+      }
       if (this.t - e.lastHitMeT < 8 || d < 75 || (closing && d < 110) || (this.T.chaseHp && e.hp < this.T.chaseHp && d < 160)) out.push(e)
     }
     return out
@@ -1228,7 +1251,7 @@ export class Brain implements Bot {
         break
       }
       case "avoid": {
-        if (this.T.openPost && !this.ffaQuiet && (this.slotOf("laser") >= 0 || this.T.gunSniper > 0) && this.healthyToSnipe()) {
+        if (this.T.openPost && !this.ffaQuiet && !this.survivorOn() && (this.slotOf("laser") >= 0 || this.T.gunSniper > 0) && this.healthyToSnipe()) {
           // sniper: hold the open ground and keep our distance while the laser works
           for (const e of this.enemies(0.5, 160)) {
             const d = Math.max(5, hyp2(this.px, this.py, e.pos[0], e.pos[1]))
@@ -1483,7 +1506,8 @@ export class Brain implements Bot {
 
   /** a nearby walkable point out of every known enemy's sight, inside the safe circle */
   findCover(sc: number[], quiet = false): number[] | null {
-    if (this.t - this.coverT < 0.6 && this.coverPt) return this.coverPt
+    if ((this.t - this.coverT < 0.6 || this.busy(this.T.budgetSearch)) && this.coverPt) return this.coverPt
+    if (this.busy(this.T.budgetSearch)) return null
     const ens = this.enemies(quiet ? 20 : 4, 260)
     this.coverT = this.t
     if (!ens.length) {
@@ -1557,6 +1581,7 @@ export class Brain implements Bot {
       const c = Math.floor((this.explore[0] - W.bminX) / 40) + Math.floor((this.explore[1] - W.bminY) / 40) * 32
       if (!this.seen[c]) return this.explore
     }
+    if (this.busy(this.T.budgetSearch)) return this.explore
     const here = W.comp[W.cellOf(this.px, this.py)]
     let best: number[] | null = null
     let bs = 1e9
@@ -1653,6 +1678,7 @@ export class Brain implements Bot {
   findPost(sc: number[]): number[] | null {
     const t = this.t
     if (this.post && t - this.postT < 10 && !this.enemies(1, 150).length && hyp2(this.post[0], this.post[1], sc[0], sc[1]) < sc[2] * (this.T.postOuter + 0.1)) return this.post
+    if (this.busy(this.T.budgetSearch)) return this.post
     this.postT = t
     const W = this.W
     const here = W.comp[W.cellOf(this.px, this.py)]
@@ -1669,7 +1695,7 @@ export class Brain implements Bot {
       const c = W.cellOf(x, y)
       if (!W.nav[c] || W.comp[c] !== here) continue
       const cl = W.clearAt(x, y)
-      const sniper = this.T.openPost && !this.ffaQuiet && (this.slotOf("laser") >= 0 || this.T.gunSniper > 0)
+      const sniper = this.T.openPost && !this.ffaQuiet && !this.survivorOn() && (this.slotOf("laser") >= 0 || this.T.gunSniper > 0)
       if (cl > 6 && !sniper) continue
       if (this.T.wallBack && cl > 7) continue
       let backWall = 0
@@ -1782,7 +1808,8 @@ export class Brain implements Bot {
   kiteP: number[] | null = null
   /** a reachable point ~50 m away that maximises distance from the engaged enemies, inside the safe circle */
   kitePoint(sc: number[]): number[] | null {
-    if (this.kiteP && this.t - this.kiteT < 0.8 && hyp2(this.px, this.py, this.kiteP[0], this.kiteP[1]) > 6) return this.kiteP
+    if (this.kiteP && ((this.t - this.kiteT < 0.8 && hyp2(this.px, this.py, this.kiteP[0], this.kiteP[1]) > 6) || this.busy(this.T.budgetSearch))) return this.kiteP
+    if (this.busy(this.T.budgetSearch)) return null
     this.kiteT = this.t
     const W = this.W
     const ens = this.enemies(2, 250)
@@ -1910,8 +1937,8 @@ export class Brain implements Bot {
       return goal
     }
     const moved = !this.pathGoal || hyp2(goal[0], goal[1], this.pathGoal[0], this.pathGoal[1]) > Math.max(6, dg * 0.15)
-    if (!this.path || moved || t - this.pathT > 3) {
-      this.path = W.path(this.px, this.py, goal[0], goal[1], 40000)
+    if ((!this.path || moved || t - this.pathT > 3) && !this.busy(this.T.budgetPath)) {
+      this.path = W.path(this.px, this.py, goal[0], goal[1], this.T.pathExpand)
       this.pathGoal = goal
       this.pathT = t
     }

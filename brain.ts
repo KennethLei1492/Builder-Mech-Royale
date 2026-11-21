@@ -80,20 +80,15 @@ export const TUNE: Record<string, number> = {
   laserGrab: 300,
   kite: 130,
   kiteMin: 30,
-  farmHp: 2,
+  farmHp: 0.9,
   dropDist: 0,
   cubeValue: 100,
   cubeRun: 0,
   postInner: 0,
   postOuter: 0.6,
   safeFrac: 0.55,
-  spin: 1,
+  spin: 0,
   roof: 0,
-  peek: 0,
-  peekMin: 35,
-  lootAvoid: 0,
-  spinSound: 1,
-  postOpen: 0.4,
   roofDist: 220,
   roofZone: 0.8,
   roofMaxH: 30,
@@ -181,13 +176,7 @@ export class Brain implements Bot {
   }
 
   // ======================================================================= main
-  t0 = 0
-  /** milliseconds used so far in this decision is above `ms` */
-  busy(ms: number): boolean {
-    return performance.now() - this.t0 > ms
-  }
   act(obs: Observation): BotAction {
-    this.t0 = performance.now()
     this.t = obs.t
     this.tick = obs.tick
     this.me = obs.self
@@ -505,12 +494,7 @@ export class Brain implements Bot {
     // laser: keep holding if charging and nothing to shoot (it auto-fires at hold_s; we release when aimed)
     const ls = this.slotOf("laser")
     const lw = ls >= 0 ? me.weapons[ls]! : null
-    if (target && tgt && tgt.isMech) this.lastLosPos = [this.px, this.py]
     if (!tgt) {
-      if (lw && this.peekOn && (lw.charge ?? 0) === 0 && lw.cooldown <= 0.05) {
-        fire[ls] = true // start charging behind cover
-        return false
-      }
       if (lw && (lw.charge ?? 0) > 0) {
         // release into the last known enemy direction rather than wasting the charge randomly
         fire[ls] = (lw.charge ?? 0) < (lw.stats.charge ?? 0.75) + (lw.stats.hold_s ?? 2) - 0.3
@@ -629,7 +613,7 @@ export class Brain implements Bot {
     for (const tr of this.tracks.values()) if (tr.kind === "mech" && (!recent || tr.seenT > recent.seenT)) recent = tr
     if (t - this.lastDamageT < 3) yaw = this.lastDamageBearing
     else if (recent && t - recent.seenT < 6) yaw = yawTo(this.px, this.py, recent.pos[0], recent.pos[1])
-    else if (this.soundHint && t - this.soundHint.t < 3 && !(TUNE.spinSound && TUNE.spin)) yaw = this.soundHint.bearing
+    else if (this.soundHint && t - this.soundHint.t < 3) yaw = this.soundHint.bearing
     if (yaw === null && TUNE.spin) {
       // scan: spin the torso; the 120° view wedge then covers every direction every ~1.6 s
       return [wrap(this.me.aim[0] + TUNE.spin), 0]
@@ -930,11 +914,6 @@ export class Brain implements Bot {
           this.strafeFlipT = t + TUNE.strafeMin + this.rnd() * TUNE.strafeVar
         }
         let radial = clamp((d - R) / Math.max(15, R * 0.5), -1, 1)
-        const pk = this.peekGoal()
-        if (pk) {
-          goal = pk
-          break
-        }
         if (TUNE.kite && this.slotOf("laser") >= 0) {
           let nd = 1e9
           for (const e of this.enemies(0.5, TUNE.kite + 10)) nd = Math.min(nd, hyp2(this.px, this.py, e.pos[0], e.pos[1]))
@@ -1174,8 +1153,7 @@ export class Brain implements Bot {
 
   /** a nearby walkable point out of every known enemy's sight, inside the safe circle */
   findCover(sc: number[], quiet = false): number[] | null {
-    if ((this.t - this.coverT < 0.6 || this.busy(15)) && this.coverPt) return this.coverPt
-    if (this.busy(15)) return null
+    if (this.t - this.coverT < 0.6 && this.coverPt) return this.coverPt
     const ens = this.enemies(quiet ? 20 : 4, 260)
     this.coverT = this.t
     if (!ens.length) {
@@ -1245,7 +1223,6 @@ export class Brain implements Bot {
       const c = Math.floor((this.explore[0] - W.bminX) / 40) + Math.floor((this.explore[1] - W.bminY) / 40) * 32
       if (!this.seen[c]) return this.explore
     }
-    if (this.busy(15)) return this.explore
     const here = W.comp[W.cellOf(this.px, this.py)]
     let best: number[] | null = null
     let bs = 1e9
@@ -1277,7 +1254,6 @@ export class Brain implements Bot {
   findPost(sc: number[]): number[] | null {
     const t = this.t
     if (this.post && t - this.postT < 10 && !this.enemies(1, 150).length && hyp2(this.post[0], this.post[1], sc[0], sc[1]) < sc[2] * (TUNE.postOuter + 0.1)) return this.post
-    if (this.busy(15)) return this.post
     this.postT = t
     const W = this.W
     const here = W.comp[W.cellOf(this.px, this.py)]
@@ -1304,7 +1280,7 @@ export class Brain implements Bot {
         open += W.ray(x, y, z, x + Math.cos(a2) * L, y + Math.sin(a2) * L, z, 2)
       }
       open /= 12
-      let s = sniper ? Math.abs(TUNE.postOpen - open) * 120 + r * 0.15 + hyp2(x, y, sc[0], sc[1]) * 0.05 : Math.abs(open - 0.45) * 100 + cl * 4 + r * 0.15 + hyp2(x, y, sc[0], sc[1]) * 0.05
+      let s = sniper ? (1 - open) * 120 + r * 0.15 + hyp2(x, y, sc[0], sc[1]) * 0.05 : Math.abs(open - 0.45) * 100 + cl * 4 + r * 0.15 + hyp2(x, y, sc[0], sc[1]) * 0.05
       for (const e of this.tracks.values()) {
         if (e.kind !== "mech" || t - e.seenT > 40) continue
         const de = hyp2(x, y, e.pos[0], e.pos[1])
@@ -1319,49 +1295,11 @@ export class Brain implements Bot {
     return this.post
   }
 
-  // ---- peek cycle: charge the laser behind cover, step out to the last firing spot, release, duck back
-  lastLosPos: number[] | null = null
-  peekOn = false
-  peekCover: number[] | null = null
-  peekCoverT = -99
-  peekActive(): boolean {
-    if (!TUNE.peek) return false
-    const ls = this.slotOf("laser")
-    if (ls < 0) return false
-    const eng = this.enemies(3, 260)
-    if (!eng.length) return false
-    for (const e of eng) if (hyp2(this.px, this.py, e.pos[0], e.pos[1]) < TUNE.peekMin) return false
-    return true
-  }
-  peekGoal(): number[] | null {
-    this.peekOn = false
-    if (!this.peekActive() || !this.lastLosPos) return null
-    const lw = this.me.weapons[this.slotOf("laser")]!
-    const full = lw.stats.charge ?? 0.75
-    const ch = lw.charge ?? 0
-    if (ch >= full - 0.05) {
-      this.peekOn = true
-      this.dbg.push("peek")
-      return this.lastLosPos
-    }
-    // reloading / charging: get out of sight
-    if (this.t - this.peekCoverT > 0.5 || !this.peekCover) {
-      if (this.busy(15)) return this.peekCover
-      this.peekCoverT = this.t
-      this.peekCover = this.quickCover(this.enemies(3, 260), [3, 6, 9, 12])
-    }
-    if (!this.peekCover) return null
-    this.peekOn = true
-    this.dbg.push("hide")
-    return this.peekCover
-  }
-
   kiteT = -99
   kiteP: number[] | null = null
   /** a reachable point ~50 m away that maximises distance from the engaged enemies, inside the safe circle */
   kitePoint(sc: number[]): number[] | null {
-    if (this.kiteP && ((this.t - this.kiteT < 0.8 && hyp2(this.px, this.py, this.kiteP[0], this.kiteP[1]) > 6) || this.busy(15))) return this.kiteP
-    if (this.busy(15)) return null
+    if (this.kiteP && this.t - this.kiteT < 0.8 && hyp2(this.px, this.py, this.kiteP[0], this.kiteP[1]) > 6) return this.kiteP
     this.kiteT = this.t
     const W = this.W
     const ens = this.enemies(2, 250)
@@ -1391,13 +1329,12 @@ export class Brain implements Bot {
   }
 
   /** nearest point within ~12 m, straight-line walkable, hidden from every mech charging a laser at us */
-  quickCover(threats?: Track[], radii = [4, 7, 10, 13]): number[] | null {
+  quickCover(): number[] | null {
     const W = this.W
-    let chargers: Track[] = []
-    if (threats) chargers = threats
-    else for (const tr of this.tracks.values()) if (tr.kind === "mech" && tr.charging && this.t - tr.seenT < 0.2) chargers.push(tr)
+    const chargers: Track[] = []
+    for (const tr of this.tracks.values()) if (tr.kind === "mech" && tr.charging && this.t - tr.seenT < 0.2) chargers.push(tr)
     if (!chargers.length) return null
-    for (const r of radii) {
+    for (const r of [4, 7, 10, 13]) {
       let best: number[] | null = null
       let bs = 1e9
       for (let k = 0; k < 16; k++) {
@@ -1454,10 +1391,7 @@ export class Brain implements Bot {
       if (!this.inSafeZone(x, y, 12)) return
       if (z > this.W.floorAt(x, y) + 2.5) return // on a roof
       const d = hyp2(this.px, this.py, x, y)
-      let s = value / (d + 25)
-      if (TUNE.lootAvoid)
-        for (const e of this.tracks.values())
-          if (e.kind === "mech" && this.t - e.seenT < TUNE.lootAvoid && hyp2(x, y, e.pos[0], e.pos[1]) < 130) s *= 0.25
+      const s = value / (d + 25)
       if (s > bs) {
         bs = s
         best = [x, y]
@@ -1493,8 +1427,8 @@ export class Brain implements Bot {
       return goal
     }
     const moved = !this.pathGoal || hyp2(goal[0], goal[1], this.pathGoal[0], this.pathGoal[1]) > Math.max(6, dg * 0.15)
-    if ((!this.path || moved || t - this.pathT > 3) && !this.busy(12)) {
-      this.path = W.path(this.px, this.py, goal[0], goal[1], 25000)
+    if (!this.path || moved || t - this.pathT > 3) {
+      this.path = W.path(this.px, this.py, goal[0], goal[1], 40000)
       this.pathGoal = goal
       this.pathT = t
     }

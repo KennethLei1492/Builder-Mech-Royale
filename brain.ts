@@ -130,7 +130,12 @@ export const TUNE: Record<string, number> = {
   ffaMode: 0,
   treePosts: 0,
   farmClear: 200,
+  roofLoot: 0,
+  roofLootH: 38,
+  spinExplore: 1,
+  exploreBoost: 0,
   farmRun: 0,
+  farmRunNoLaser: 0,
   farmQuiet: 20,
   farmNpcR: 160,
   farmCrateR: 130,
@@ -739,6 +744,10 @@ export class Brain implements Bot {
     if (t - this.lastDamageT < 3) yaw = this.lastDamageBearing
     else if (recent && t - recent.seenT < 6) yaw = yawTo(this.px, this.py, recent.pos[0], recent.pos[1])
     else if (this.soundHint && t - this.soundHint.t < 3) yaw = this.soundHint.bearing
+    if (yaw === null && this.T.spinExplore && this.wantsWeapons()) {
+      // still looking for a laser: sweep the whole horizon, weapons show up to 200 m in the view wedge
+      return [wrap(this.me.aim[0] + 1), 0]
+    }
     if (yaw === null && this.T.spin) {
       // scan: spin the torso; the 120° view wedge then covers every direction every ~1.6 s
       return [wrap(this.me.aim[0] + this.T.spin), 0]
@@ -1030,12 +1039,83 @@ export class Brain implements Bot {
     return true
   }
 
+  // ---- rooftop loot: a quarter of the floor weapons lie on roofs; jump-jet up for a laser we know about
+  lootRoof: { x: number; y: number; z: number; id: number; kind: string } | null = null
+  lootRoofBase: number[] | null = null
+  lootRoofPhase = ""
+  lootRoofT = -99
+  roofLootLocomotion(a: BotAction, sc: number[]): boolean {
+    if (!this.T.roofLoot) return false
+    const me = this.me
+    const W = this.W
+    let T = this.lootRoof
+    if (T && (!this.memPickups.has(T.id) || this.badPickups.has(T.id) || this.loadoutGain(T.kind).gain <= 0 || !this.inSafeZone(T.x, T.y, 5) || this.t - this.lootRoofT > 40)) T = this.lootRoof = null
+    const climbing = !!T && this.lootRoofPhase !== "approach"
+    if (!climbing && (this.engagedSet().length || this.enemies(2, 120).length)) {
+      this.lootRoof = null
+      return false
+    }
+    if (!T) {
+      let bd = this.T.roofLoot
+      const here = W.comp[W.cellOf(this.px, this.py)]
+      for (const p of this.memPickups.values()) {
+        if (p.id < 0 || this.badPickups.has(p.id)) continue
+        const f = W.floorAt(p.pos[0], p.pos[1])
+        if (p.pos[2] <= f + 2.5) continue
+        if (this.loadoutGain(p.kind).gain < 0.5 || !this.inSafeZone(p.pos[0], p.pos[1], 8)) continue
+        const hgt = p.pos[2] - this.pz
+        if (hgt > this.T.roofLootH) continue
+        const d = hyp2(this.px, this.py, p.pos[0], p.pos[1])
+        if (d >= bd) continue
+        const c = W.nearestNav(p.pos[0], p.pos[1], 15, here)
+        if (c < 0) continue
+        bd = d
+        T = { x: p.pos[0], y: p.pos[1], z: p.pos[2], id: p.id, kind: p.kind }
+        this.lootRoofBase = [W.cellX(c), W.cellY(c)]
+      }
+      if (!T) return false
+      this.lootRoof = T
+      this.lootRoofPhase = "approach"
+      this.lootRoofT = this.t
+    }
+    const dT = hyp2(this.px, this.py, T.x, T.y)
+    this.dbg.push("roofloot")
+    if (me.grounded && Math.abs(this.pz - T.z) < 2 && this.pz > W.floorAt(this.px, this.py) + 2.5) {
+      // on its roof: walk to the weapon (the take happens in loot())
+      a.move = dT > 0.5 ? [(T.x - this.px) / dT, (T.y - this.py) / dT] : [0, 0]
+      return true
+    }
+    const base = this.lootRoofBase!
+    const dB = hyp2(this.px, this.py, base[0], base[1])
+    const need = ((T.z - this.pz + 2) / 10) * (me.stats.jet_drain ?? 15) + 12
+    if (this.lootRoofPhase === "approach") {
+      if (dB < 5 && me.energy >= Math.min(need, (me.max_energy ?? 100) - 2)) this.lootRoofPhase = "climb"
+      else {
+        const wp = this.followPath(base)
+        if (wp && dB >= 5) {
+          const d = hyp2(this.px, this.py, wp[0], wp[1])
+          a.move = this.steer((wp[0] - this.px) / Math.max(0.01, d), (wp[1] - this.py) / Math.max(0.01, d))
+        } else a.move = [0, 0]
+        return true
+      }
+    }
+    a.move = [(T.x - this.px) / Math.max(0.01, dT), (T.y - this.py) / Math.max(0.01, dT)]
+    if (me.grounded && this.pz < T.z - 1) a.jump = true
+    a.boost = this.pz < T.z + 1.5 && me.energy > 1
+    if (me.grounded && this.pz < T.z - 1 && me.energy < 5) {
+      this.badPickups.add(T.id) // could not make the climb
+      this.lootRoof = null
+    }
+    return true
+  }
+
   locomotion(obs: Observation, target: Track | null, a: BotAction) {
     const me = this.me
     const t = this.t
     {
       const sc0 = this.safeCircle()
       if (this.roofLocomotion(obs, a, sc0)) return
+      if (this.roofLootLocomotion(a, sc0)) return
     }
     let goal: number[] | null = null
     let desire: number[] = [0, 0] // local steering intent (unit-ish), used when no path goal
@@ -1175,7 +1255,7 @@ export class Brain implements Bot {
             const f = this.farmTarget(obs)
             if (f && f.kind === "crate" && hyp2(this.px, this.py, f.pos[0], f.pos[1]) > 35) goal = [f.pos[0], f.pos[1]]
           }
-          if (!goal && this.T.farmRun && me.hp >= me.max_hp * this.T.farmHp) {
+          if (!goal && this.T.farmRun && (!this.T.farmRunNoLaser || this.slotOf("laser") < 0) && me.hp >= me.max_hp * this.T.farmHp) {
             // nobody around: walk to the nearest remembered crate or drone and farm it
             let quiet = true
             for (const e of this.tracks.values()) if (e.kind === "mech" && t - e.seenT < this.T.farmQuiet && hyp2(this.px, this.py, e.pos[0], e.pos[1]) < 250) quiet = false
@@ -1197,7 +1277,10 @@ export class Brain implements Bot {
           }
           if (!goal && this.wantsWeapons()) {
             goal = this.exploreGoal(sc)
-            if (goal) this.dbg.push("explore")
+            if (goal) {
+              this.dbg.push("explore")
+              if (this.T.exploreBoost && me.energy > this.T.exploreBoost) boost = true
+            }
           }
           if (!goal && this.T.relocate) {
             const rp = this.relocGoal(sc)

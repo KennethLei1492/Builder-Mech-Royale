@@ -83,7 +83,7 @@ export const TUNE: Record<string, number> = {
   laserGrab: 300,
   kite: 130,
   kiteMin: 30,
-  farmHp: 0.9,
+  farmHp: 0.5,
   dropDist: 0,
   cubeValue: 100,
   cubeRun: 0,
@@ -129,6 +129,11 @@ export const TUNE: Record<string, number> = {
   chaseHp: 450,
   ffaMode: 0,
   treePosts: 0,
+  farmClear: 200,
+  farmRun: 0,
+  farmQuiet: 20,
+  farmNpcR: 160,
+  farmCrateR: 130,
   phantom: 1,
   phantomGunD: 90,
   phantomLaserD: 120,
@@ -306,6 +311,22 @@ export class Brain implements Bot {
       const d = hyp2(this.px, this.py, p.pos[0], p.pos[1])
       if (d < 25 || (k < 0 && t - p.t > 90) || (d < 45 && this.W.los([this.px, this.py, this.pz + this.eye], [p.pos[0], p.pos[1], p.pos[2] + 0.5]))) this.memPickups.delete(k)
     }
+    // crates and drones we have seen: farmable later (cubes = max HP, damage, upgrades)
+    const visFarm = new Set<number>()
+    for (const c of obs.crates) {
+      visFarm.add(c.id)
+      if (c.pos[2] <= this.W.floorAt(c.pos[0], c.pos[1]) + 2.5) this.memFarm.set(c.id, { pos: c.pos, kind: "crate", t })
+    }
+    for (const m of obs.mechs) {
+      if (m.kind !== "npc") continue
+      visFarm.add(m.id)
+      this.memFarm.set(m.id, { pos: m.pos, kind: "npc", t })
+    }
+    for (const [k, f] of this.memFarm) {
+      if (visFarm.has(k)) continue
+      const d = hyp2(this.px, this.py, f.pos[0], f.pos[1])
+      if (t - f.t > 240 || (d < 40 && this.W.los([this.px, this.py, this.pz + this.eye], [f.pos[0], f.pos[1], f.pos[2] + 1.5]))) this.memFarm.delete(k)
+    }
     const visCubes = new Set<number>()
     for (const c of obs.cubes) {
       visCubes.add(c.id)
@@ -470,14 +491,14 @@ export class Brain implements Bot {
 
   /** NPC or crate to farm when no mech is around */
   farmTarget(obs: Observation): { pos: number[]; id: number; kind: "npc" | "crate"; hp: number } | null {
-    if (this.enemies(1.5, 200).length) return null
+    if (this.enemies(1.5, this.T.farmClear).length) return null
     if (this.me.hp < this.me.max_hp * this.T.farmHp) return null
     let best: { pos: number[]; id: number; kind: "npc" | "crate"; hp: number } | null = null
     let bd = 1e9
     for (const m of obs.mechs) {
       if (m.kind !== "npc") continue
       const d = hyp2(this.px, this.py, m.pos[0], m.pos[1])
-      if (d > 110 || !this.inSafeZone(m.pos[0], m.pos[1], 10)) continue
+      if (d > this.T.farmNpcR || !this.inSafeZone(m.pos[0], m.pos[1], 10)) continue
       const tr = this.tracks.get(m.id)
       if (!tr || !this.canHit(tr)) continue
       if (d < bd) {
@@ -487,7 +508,7 @@ export class Brain implements Bot {
     }
     for (const c of obs.crates) {
       const d = hyp2(this.px, this.py, c.pos[0], c.pos[1])
-      if (d > 90 || d + 15 > bd || !this.inSafeZone(c.pos[0], c.pos[1], 10)) continue
+      if (d > this.T.farmCrateR || d + 15 > bd || !this.inSafeZone(c.pos[0], c.pos[1], 10)) continue
       const m = this.muzzlePos()
       if (this.W.ray(m[0], m[1], m[2], c.pos[0], c.pos[1], c.pos[2] + 1.2, 1) < 0.97) continue
       bd = d + 15
@@ -1154,6 +1175,26 @@ export class Brain implements Bot {
             const f = this.farmTarget(obs)
             if (f && f.kind === "crate" && hyp2(this.px, this.py, f.pos[0], f.pos[1]) > 35) goal = [f.pos[0], f.pos[1]]
           }
+          if (!goal && this.T.farmRun && me.hp >= me.max_hp * this.T.farmHp) {
+            // nobody around: walk to the nearest remembered crate or drone and farm it
+            let quiet = true
+            for (const e of this.tracks.values()) if (e.kind === "mech" && t - e.seenT < this.T.farmQuiet && hyp2(this.px, this.py, e.pos[0], e.pos[1]) < 250) quiet = false
+            if (quiet) {
+              let bf: number[] | null = null
+              let bd = this.T.farmRun
+              for (const f of this.memFarm.values()) {
+                const d = hyp2(this.px, this.py, f.pos[0], f.pos[1])
+                if (d < bd && d > 45 && this.inSafeZone(f.pos[0], f.pos[1], 12)) {
+                  bd = d
+                  bf = [f.pos[0], f.pos[1]]
+                }
+              }
+              if (bf) {
+                goal = bf
+                this.dbg.push("farmrun")
+              }
+            }
+          }
           if (!goal && this.wantsWeapons()) {
             goal = this.exploreGoal(sc)
             if (goal) this.dbg.push("explore")
@@ -1417,6 +1458,7 @@ export class Brain implements Bot {
     return best
   }
 
+  memFarm = new Map<number, { pos: number[]; kind: string; t: number }>()
   memCubes = new Map<number, { id: number; pos: number[]; t: number }>()
   memPickups = new Map<number, { id: number; kind: string; pos: number[]; t: number }>()
   /** after a fight, get well away from where the squad last saw us (their memory of us fades) */

@@ -35,7 +35,6 @@ type Track = {
 
 type Mode = "zone" | "fight" | "retreat" | "regen" | "loot" | "patrol" | "drop" | "avoid"
 
-const WEAPON_VALUE: Record<string, number> = { lightning: 3.2, laser: 2.7, gun: 2.0, mortar: 1.1 }
 
 const UPGRADE_SCORE: Record<string, number> = {
   armor: 10,
@@ -71,9 +70,17 @@ export const TUNE: Record<string, number> = {
   noRetreat: 1,
   rangeGun: 55,
   rangeLightning: 24,
-  rangeLaser: 85,
+  rangeLaser: 130,
   regenHp: 0.85,
   grabDist: 50,
+  strafeMin: 0.45,
+  strafeVar: 0.9,
+  tang: 0.85,
+  fightBoost: 0,
+  vLightning: 2.2,
+  vLaser: 3.4,
+  vGun: 2.9,
+  vMortar: 1.1,
   hpWeight: 70,
   zapReserve: 6,
 }
@@ -565,7 +572,7 @@ export class Brain implements Bot {
     let bi = 0,
       bs = -1
     ch.forEach((c, i) => {
-      let s = UPGRADE_SCORE[c.id] ?? 3
+      let s = TUNE["up_" + c.id] ?? UPGRADE_SCORE[c.id] ?? 3
       if (c.id.startsWith("gun_") && this.slotOf("gun") < 0) s = 0.5
       if (c.id.startsWith("laser_") && this.slotOf("laser") < 0) s = 0.5
       if (c.id.startsWith("lightning_") && this.slotOf("lightning") < 0) s = 0.5
@@ -581,10 +588,13 @@ export class Brain implements Bot {
   }
 
   // ======================================================================= loot
+  wval(kind: string): number {
+    return kind === "lightning" ? TUNE.vLightning : kind === "laser" ? TUNE.vLaser : kind === "gun" ? TUNE.vGun : kind === "mortar" ? TUNE.vMortar : 0
+  }
   loadoutGain(kind: string): { gain: number; drop: number | null } {
     const w = this.me.weapons
     if (w.some((x) => x?.kind === kind)) return { gain: 0, drop: null }
-    const v = WEAPON_VALUE[kind] ?? 0
+    const v = this.wval(kind)
     if (!w[0]) return { gain: v, drop: null }
     if (!w[1]) return { gain: v, drop: null }
     let worst = 0
@@ -592,7 +602,7 @@ export class Brain implements Bot {
     for (let i = 0; i < 2; i++) {
       const x = w[i]!
       if (x.kind === "laser" && (x.charge ?? 0) > 0) continue
-      const xv = WEAPON_VALUE[x.kind] ?? 0
+      const xv = this.wval(x.kind)
       if (xv < wv) {
         wv = xv
         worst = i
@@ -737,7 +747,7 @@ export class Brain implements Bot {
           uy = (tr.pos[1] - this.py) / Math.max(1, d)
         if (t > this.strafeFlipT) {
           this.strafeSign = this.rnd() < 0.5 ? -1 : 1
-          this.strafeFlipT = t + 0.45 + this.rnd() * 0.9
+          this.strafeFlipT = t + TUNE.strafeMin + this.rnd() * TUNE.strafeVar
         }
         let radial = clamp((d - R) / Math.max(15, R * 0.5), -1, 1)
         if (!this.canHit(tr)) {
@@ -745,7 +755,7 @@ export class Brain implements Bot {
           goal = [tr.pos[0], tr.pos[1]]
           break
         }
-        const tang = this.laserThreat ? 1 : 0.85
+        const tang = this.laserThreat ? 1 : TUNE.tang
         desire = [ux * radial + -uy * this.strafeSign * tang, uy * radial + ux * this.strafeSign * tang]
         // several on us: back away from the others while we work on this one
         const others = this.engagedSet().filter((e) => e.id !== tr.id)
@@ -775,6 +785,7 @@ export class Brain implements Bot {
           if (me.energy > 20) boost = true
         }
         if (radial > 0.6 && this.slotOf("lightning") >= 0 && me.energy > 55 && d < 90) boost = true
+        if (TUNE.fightBoost && me.energy > TUNE.fightBoost) boost = true
         // keep in the zone
         const dz = hyp2(this.px, this.py, sc[0], sc[1])
         if (dz > sc[2] - 15) {

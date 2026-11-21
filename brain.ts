@@ -80,9 +80,9 @@ export const TUNE: Record<string, number> = {
   grabDist: 50,
   avoidFire: 230,
   snipe: 1,
-  explore: 0,
+  explore: 1,
   laserLoot: 90,
-  laserGrab: 0,
+  laserGrab: 300,
   kite: 130,
   kiteMin: 30,
   farmHp: 0.5,
@@ -107,10 +107,10 @@ export const TUNE: Record<string, number> = {
   strafeVar: 0.9,
   tang: 0.85,
   fightBoost: 0,
-  vLightning: 0,
-  vLaser: 0,
+  vLightning: 2.2,
+  vLaser: 3.4,
   vGun: 2.9,
-  vMortar: 0,
+  vMortar: 1.1,
   hpWeight: 70,
   zapReserve: 6,
   faceIn: 1,
@@ -133,6 +133,8 @@ export const TUNE: Record<string, number> = {
   treePosts: 0,
   farmClear: 200,
   openFarm: 0,
+  exploreAvoid: 0,
+  laserTarget: 0,
   budgetPath: 12,
   budgetSearch: 15,
   pathExpand: 25000,
@@ -144,7 +146,7 @@ export const TUNE: Record<string, number> = {
   beamPhantom: 0,
   roofLoot: 0,
   roofLootH: 38,
-  spinExplore: 0,
+  spinExplore: 1,
   exploreBoost: 0,
   farmRun: 0,
   farmRunNoLaser: 0,
@@ -507,6 +509,7 @@ export class Brain implements Bot {
       if (this.t - tr.lastHitMeT < 2) s -= 35
       if (tr.id === this.targetId) s -= 30
       if (tr.weapons.includes("laser") && tr.charging) s -= 20
+      if (this.T.laserTarget && tr.weapons.includes("laser") && this.slotOf("laser") < 0) s -= this.T.laserTarget
       if (this.T.chaseHp && tr.hp < this.T.chaseHp) s -= 60
       const by = yawTo(this.px, this.py, tr.pos[0], tr.pos[1])
       if (this.T.arcPen) {
@@ -1251,6 +1254,15 @@ export class Brain implements Bot {
         break
       }
       case "avoid": {
+        if (this.T.exploreAvoid && this.wantsWeapons()) {
+          // enemies in sight but none on us: keep looking for a laser rather than holding still
+          const g = this.lootGoal(obs, sc) ?? this.exploreGoal(sc)
+          if (g) {
+            goal = g
+            this.dbg.push("explore*")
+            break
+          }
+        }
         if (this.T.openPost && !this.ffaQuiet && !this.survivorOn() && (this.slotOf("laser") >= 0 || this.T.gunSniper > 0) && this.healthyToSnipe()) {
           // sniper: hold the open ground and keep our distance while the laser works
           for (const e of this.enemies(0.5, 160)) {

@@ -2,5 +2,5 @@
 # as uid 65534, with the map mounted read-only at /arena.
 FROM oven/bun:1.4.4-slim
 WORKDIR /bot
-COPY package.json main.ts brain.ts world.ts util.ts mechfight.ts ./
+COPY package.json *.ts ./
 ENTRYPOINT ["bun", "/bot/main.ts"]

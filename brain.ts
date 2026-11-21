@@ -43,8 +43,8 @@ const UPGRADE_SCORE: Record<string, number> = {
   lightning_range: 7.5,
   lightning_efficiency: 6.5,
   lightning_chain: 4,
-  laser_charge: 7,
-  laser_damage: 7,
+  laser_charge: 10.5,
+  laser_damage: 11,
   laser_pierce: 2,
   gun_rate: 6.5,
   gun_damage: 6.5,
@@ -68,11 +68,36 @@ export const TUNE: Record<string, number> = {
   retreat2: 0.5, // 2+ engaged
   powerRatio: 0.5,
   noRetreat: 1,
-  rangeGun: 55,
+  rangeGun: 90,
   rangeLightning: 24,
   rangeLaser: 130,
   regenHp: 0.85,
   grabDist: 50,
+  avoidFire: 230,
+  snipe: 1,
+  explore: 1,
+  laserLoot: 90,
+  laserGrab: 300,
+  kite: 130,
+  kiteMin: 30,
+  farmHp: 0.9,
+  dropDist: 0,
+  cubeValue: 100,
+  cubeRun: 0,
+  postInner: 0,
+  postOuter: 0.6,
+  safeFrac: 0.55,
+  spin: 0,
+  roof: 0,
+  roofDist: 220,
+  roofZone: 0.8,
+  roofMaxH: 30,
+  roofEdge: 4.5,
+  snipeHp: 0,
+  snipeMaxVis: 99,
+  openPost: 1,
+  gunSniper: 170,
+  exploreUntil: 200,
   strafeMin: 0.45,
   strafeVar: 0.9,
   tang: 0.85,
@@ -147,6 +172,7 @@ export class Brain implements Bot {
     this.slot = hello.slot
     this.rnd = mulberry32(hello.seed ^ 0x9e3779b9)
     this.W = getWorld(hello.map.dir)
+    if (TUNE.roof) this.W.roofSpots(TUNE.roofEdge)
   }
 
   // ======================================================================= main
@@ -162,6 +188,7 @@ export class Brain implements Bot {
     this.radius = me.stats.radius ?? this.cfg.mech.radius * this.sf
     this.dbg.length = 0
     this.perceive(obs)
+    this.markSeen()
 
     const a: BotAction = {}
     if (obs.offer) a.pick = this.pickUpgrade(obs)
@@ -201,6 +228,27 @@ export class Brain implements Bot {
       tr.charging = !!m.charging
       tr.seenT = t
     }
+    // weapon pickups we've seen (and expect from kills); drop entries whose spot we can see is empty
+    const visIds = new Set<number>()
+    for (const p of obs.pickups) {
+      visIds.add(p.id)
+      this.memPickups.set(p.id, { id: p.id, kind: p.kind, pos: p.pos, t })
+    }
+    for (const [k, p] of this.memPickups) {
+      if (visIds.has(k)) continue
+      const d = hyp2(this.px, this.py, p.pos[0], p.pos[1])
+      if (d < 25 || (k < 0 && t - p.t > 90) || (d < 45 && this.W.los([this.px, this.py, this.pz + this.eye], [p.pos[0], p.pos[1], p.pos[2] + 0.5]))) this.memPickups.delete(k)
+    }
+    const visCubes = new Set<number>()
+    for (const c of obs.cubes) {
+      visCubes.add(c.id)
+      this.memCubes.set(c.id, { id: c.id, pos: c.pos, t })
+    }
+    for (const [k, c] of this.memCubes) {
+      if (visCubes.has(k)) continue
+      const d = hyp2(this.px, this.py, c.pos[0], c.pos[1])
+      if (d < 6 || t - c.t > 120 || (d < 40 && this.W.los([this.px, this.py, this.pz + this.eye], [c.pos[0], c.pos[1], c.pos[2] + 0.5]))) this.memCubes.delete(k)
+    }
     // forget the dead / very stale
     for (const [id, tr] of this.tracks) if (t - tr.seenT > 60) this.tracks.delete(id)
     this.laserThreat = false
@@ -220,6 +268,9 @@ export class Brain implements Bot {
         }
         this.dmgWindow.push({ t, amt: e.amount })
       } else if (e.type === "kill") {
+        const dead = this.tracks.get(e.target)
+        if (dead) this.memCubes.set(-5000 - e.target, { id: -1, pos: dead.pos, t })
+        if (dead) for (const k of dead.weapons) if (k !== "gun") this.memPickups.set(-1000 - e.target * 4 - this.memPickups.size, { id: -1, kind: k, pos: dead.pos, t })
         this.tracks.delete(e.target)
         if (this.targetId === e.target) this.targetId = -1
       } else if (e.type === "take_failed") {
@@ -317,7 +368,7 @@ export class Brain implements Bot {
   /** NPC or crate to farm when no mech is around */
   farmTarget(obs: Observation): { pos: number[]; id: number; kind: "npc" | "crate"; hp: number } | null {
     if (this.enemies(1.5, 200).length) return null
-    if (this.me.hp < this.me.max_hp * 0.45) return null
+    if (this.me.hp < this.me.max_hp * TUNE.farmHp) return null
     let best: { pos: number[]; id: number; kind: "npc" | "crate"; hp: number } | null = null
     let bd = 1e9
     for (const m of obs.mechs) {
@@ -451,11 +502,17 @@ export class Brain implements Bot {
       return false
     }
     const d = hyp2(this.px, this.py, tgt.pos[0], tgt.pos[1])
-    if (this.mode === "avoid" && tgt.isMech && d > 90 && !(lw && (lw.charge ?? 0) > 0)) return false
+    if (this.mode === "avoid" && !this.healthyToSnipe() && !(lw && (lw.charge ?? 0) > 0)) return false
+    if (this.mode === "avoid" && tgt.isMech && d > TUNE.avoidFire && !(lw && (lw.charge ?? 0) > 0)) {
+      // not engaged yet: only the laser snipes (outranges everything), the gun stays quiet
+      const gunSnipe = TUNE.gunSniper > 0 && !lw && d < TUNE.gunSniper
+      if (!(TUNE.snipe && lw && lw.cooldown <= 0.05 && d < (lw.stats.range ?? 280) * 0.97) && !gunSnipe) return false
+    }
     const m = this.muzzlePos()
     // primary aim: gun lead if we have a gun, else direct
     const gs = this.slotOf("gun")
-    const gw = gs >= 0 ? me.weapons[gs]! : null
+    let gw = gs >= 0 ? me.weapons[gs]! : null
+    if (this.mode === "avoid" && d > TUNE.avoidFire && !(TUNE.gunSniper > 0 && !lw && d < TUNE.gunSniper)) gw = null
     const gunSpeed = gw?.stats.speed ?? 252
     const [yaw, pitch] = this.leadAim(tgt.pos, tgt.vel, tgt.zOff, gunSpeed, 0.06)
     const direct = [Math.atan2(tgt.pos[1] - m[1], tgt.pos[0] - m[0]), Math.atan2(tgt.pos[2] + tgt.zOff - m[2], Math.max(0.5, d))]
@@ -557,6 +614,10 @@ export class Brain implements Bot {
     if (t - this.lastDamageT < 3) yaw = this.lastDamageBearing
     else if (recent && t - recent.seenT < 6) yaw = yawTo(this.px, this.py, recent.pos[0], recent.pos[1])
     else if (this.soundHint && t - this.soundHint.t < 3) yaw = this.soundHint.bearing
+    if (yaw === null && TUNE.spin) {
+      // scan: spin the torso; the 120° view wedge then covers every direction every ~1.6 s
+      return [wrap(this.me.aim[0] + TUNE.spin), 0]
+    }
     if (yaw === null) {
       // scan: sweep around the movement direction
       const mv = a.move
@@ -653,6 +714,9 @@ export class Brain implements Bot {
   }
 
   // ======================================================================= intent
+  healthyToSnipe(): boolean {
+    return this.me.hp >= this.me.max_hp * TUNE.snipeHp && this.enemies(0.5, 220).length <= TUNE.snipeMaxVis
+  }
   /** enemies that are actually on us: hit us recently or are close */
   engagedSet(maxD = 130): Track[] {
     const out: Track[] = []
@@ -717,9 +781,109 @@ export class Brain implements Bot {
   }
 
   // ======================================================================= locomotion
+  // ---- rooftop sniping
+  roofT: { x: number; y: number; z: number; g: number } | null = null
+  roofPhase = ""
+  roofPickT = -99
+  roofBase: number[] | null = null
+  onRoof(): boolean {
+    return this.pz > this.W.floorAt(this.px, this.py) + 3
+  }
+  chooseRoof(sc: number[]): void {
+    if (this.t - this.roofPickT < 3) return
+    this.roofPickT = this.t
+    let best: { x: number; y: number; z: number; g: number } | null = null
+    let bs = 1e9
+    for (const sp of this.W.roofSpots(TUNE.roofEdge)) {
+      const d = hyp2(this.px, this.py, sp.x, sp.y)
+      if (d > TUNE.roofDist) continue
+      if (hyp2(sp.x, sp.y, sc[0], sc[1]) > sc[2] * TUNE.roofZone) continue
+      const hgt = sp.z - Math.max(this.pz, sp.g)
+      if (hgt > TUNE.roofMaxH || hgt < 6) continue
+      let s = d + Math.abs(hgt - 16) * 2
+      for (const e of this.tracks.values()) if (e.kind === "mech" && this.t - e.seenT < 10 && hyp2(sp.x, sp.y, e.pos[0], e.pos[1]) < 60) s += 200
+      if (s < bs) {
+        bs = s
+        best = sp
+      }
+    }
+    if (best) {
+      const c = this.W.nearestNav(best.x, best.y, 15, this.W.comp[this.W.cellOf(this.px, this.py)])
+      if (c < 0) return
+      this.roofT = best
+      this.roofBase = [this.W.cellX(c), this.W.cellY(c)]
+      this.roofPhase = "approach"
+    }
+  }
+  /** returns true when it handled locomotion */
+  roofLocomotion(obs: Observation, a: BotAction, sc: number[]): boolean {
+    if (!TUNE.roof) return false // experimental, off by default
+    const me = this.me
+    const hasL = this.slotOf("laser") >= 0
+    if (this.mode === "zone" || (!hasL && TUNE.roof < 2)) {
+      if (this.roofT && !this.onRoof()) this.roofT = null
+      if (!this.onRoof()) return false
+    }
+    const R = this.roofT
+    if (R && hyp2(R.x, R.y, sc[0], sc[1]) > sc[2] - 10) {
+      this.roofT = null // zone is leaving it behind: walk off
+      return false
+    }
+    if (!R) {
+      if (this.onRoof()) {
+        // on some roof without a plan: stay put unless the zone wants us elsewhere
+        if (hyp2(this.px, this.py, sc[0], sc[1]) > sc[2] - 10) return false
+        a.move = [0, 0]
+        return true
+      }
+      if (this.engagedSet(60).length) return false
+      this.chooseRoof(sc)
+      if (!this.roofT) return false
+    }
+    const T = this.roofT!
+    const dT = hyp2(this.px, this.py, T.x, T.y)
+    if (this.onRoof() && Math.abs(this.pz - T.z) < 1.5) {
+      this.roofPhase = "on"
+      a.move = dT > 1.5 ? [(T.x - this.px) / dT, (T.y - this.py) / dT] : [0, 0]
+      if (dT < 4) a.move = [a.move[0] * 0.4, a.move[1] * 0.4]
+      this.dbg.push("roof")
+      return true
+    }
+    const base = this.roofBase!
+    const dB = hyp2(this.px, this.py, base[0], base[1])
+    const need = ((T.z - this.pz + 2) / 10) * (me.stats.jet_drain ?? 15) + 12
+    if (this.roofPhase === "approach") {
+      if (dB < 5 && me.energy >= need) this.roofPhase = "climb"
+      else {
+        const wp = this.followPath(base)
+        if (wp) {
+          const d = hyp2(this.px, this.py, wp[0], wp[1])
+          const dir = this.steer((wp[0] - this.px) / Math.max(0.01, d), (wp[1] - this.py) / Math.max(0.01, d))
+          a.move = dB < 5 ? [0, 0] : dir
+        }
+        this.dbg.push("toroof")
+        return true
+      }
+    }
+    // climb: push toward the spot, jump, jet until the feet clear the roof
+    a.move = [(T.x - this.px) / Math.max(0.01, dT), (T.y - this.py) / Math.max(0.01, dT)]
+    if (me.grounded && this.pz < T.z - 1) a.jump = true
+    a.boost = this.pz < T.z + 1.5 && me.energy > 1
+    if (me.grounded && this.pz < T.z - 1 && me.energy < 5) {
+      this.roofT = null // failed climb
+      this.roofPhase = ""
+    }
+    this.dbg.push("climb")
+    return true
+  }
+
   locomotion(obs: Observation, target: Track | null, a: BotAction) {
     const me = this.me
     const t = this.t
+    {
+      const sc0 = this.safeCircle()
+      if (this.roofLocomotion(obs, a, sc0)) return
+    }
     let goal: number[] | null = null
     let desire: number[] = [0, 0] // local steering intent (unit-ish), used when no path goal
     let boost = false
@@ -727,7 +891,7 @@ export class Brain implements Bot {
     const sc = this.safeCircle()
     const toSafe = () => {
       const d = hyp2(this.px, this.py, sc[0], sc[1])
-      const r = sc[2] * 0.55
+      const r = sc[2] * TUNE.safeFrac
       if (d <= r) return null
       const k = r / d
       return [sc[0] + (this.px - sc[0]) * k, sc[1] + (this.py - sc[1]) * k]
@@ -750,6 +914,18 @@ export class Brain implements Bot {
           this.strafeFlipT = t + TUNE.strafeMin + this.rnd() * TUNE.strafeVar
         }
         let radial = clamp((d - R) / Math.max(15, R * 0.5), -1, 1)
+        if (TUNE.kite && this.slotOf("laser") >= 0) {
+          let nd = 1e9
+          for (const e of this.enemies(0.5, TUNE.kite + 10)) nd = Math.min(nd, hyp2(this.px, this.py, e.pos[0], e.pos[1]))
+          if (nd < TUNE.kite && nd > TUNE.kiteMin) {
+            const kp = this.kitePoint(sc)
+            if (kp) {
+              goal = kp
+              this.dbg.push("kite")
+              break
+            }
+          }
+        }
         if (!this.canHit(tr)) {
           // no line of fire: path toward it to get a shot (or wait for it if we hold lightning and it's close)
           goal = [tr.pos[0], tr.pos[1]]
@@ -795,6 +971,15 @@ export class Brain implements Bot {
         break
       }
       case "avoid": {
+        if (TUNE.openPost && (this.slotOf("laser") >= 0 || TUNE.gunSniper > 0) && this.healthyToSnipe()) {
+          // sniper: hold the open ground and keep our distance while the laser works
+          for (const e of this.enemies(0.5, 160)) {
+            const d = Math.max(5, hyp2(this.px, this.py, e.pos[0], e.pos[1]))
+            desire[0] += ((this.px - e.pos[0]) / d) * (160 - d) / 60
+            desire[1] += ((this.py - e.pos[1]) / d) * (160 - d) / 60
+          }
+          break
+        }
         // enemies around that are not on us yet: slip out of their sight, don't walk into them
         const cp = this.findCover(sc, true)
         if (cp && hyp2(this.px, this.py, cp[0], cp[1]) > 3) goal = cp
@@ -836,6 +1021,10 @@ export class Brain implements Bot {
             const f = this.farmTarget(obs)
             if (f && f.kind === "crate" && hyp2(this.px, this.py, f.pos[0], f.pos[1]) > 35) goal = [f.pos[0], f.pos[1]]
           }
+          if (!goal && this.wantsWeapons()) {
+            goal = this.exploreGoal(sc)
+            if (goal) this.dbg.push("explore")
+          }
           if (!goal) {
             // wait at a post with a wall at our back
             const post = this.findPost(sc)
@@ -843,6 +1032,58 @@ export class Brain implements Bot {
           }
         }
         break
+      }
+    }
+    // supply drop: +cubes and a full repair; head there from anything but a close brawl
+    if (TUNE.dropDist > 0 && this.mode !== "zone") {
+      const closeEng = this.engagedSet(60).length
+      for (const d of obs.drops) {
+        const dd = hyp2(this.px, this.py, d.pos[0], d.pos[1])
+        if (dd > TUNE.dropDist || closeEng >= 2) continue
+        if (d.holder !== null && d.holder !== this.me.id && d.progress > 1) continue
+        const travel = dd / (me.stats.walk_speed ?? 11.7)
+        if (travel > d.lands_in + 25) continue
+        if (!this.inSafeZone(d.pos[0], d.pos[1], 0) && dd > 30) continue
+        goal = [d.pos[0], d.pos[1]]
+        this.dbg.push("drop")
+        if (dd < d.radius - 1.5) goal = null
+        if (dd > 40 && me.energy > 50 && travel > d.lands_in) boost = true
+        break
+      }
+    }
+    // cube run between fights
+    if (TUNE.cubeRun && (this.mode === "avoid" || this.mode === "regen") && !this.engagedSet().length) {
+      let bc: number[] | null = null
+      let bd = TUNE.cubeRun
+      for (const c of this.memCubes.values()) {
+        if (c.pos[2] > this.W.floorAt(c.pos[0], c.pos[1]) + 2.5 || !this.inSafeZone(c.pos[0], c.pos[1], 8)) continue
+        const d = hyp2(this.px, this.py, c.pos[0], c.pos[1])
+        if (d < bd) {
+          bd = d
+          bc = [c.pos[0], c.pos[1]]
+        }
+      }
+      if (bc) {
+        goal = bc
+        this.dbg.push("cuberun")
+      }
+    }
+    // a laser is worth a detour from anything but the zone
+    if (this.mode !== "zone" && this.slotOf("laser") < 0) {
+      let bl: number[] | null = null
+      let bd = TUNE.laserGrab
+      for (const p of this.memPickups.values()) {
+        if (p.kind !== "laser" || this.badPickups.has(p.id) || p.pos[2] > this.W.floorAt(p.pos[0], p.pos[1]) + 2.5 || !this.inSafeZone(p.pos[0], p.pos[1], 8)) continue
+        const d = hyp2(this.px, this.py, p.pos[0], p.pos[1])
+        if (d < bd) {
+          bd = d
+          bl = [p.pos[0], p.pos[1]]
+        }
+      }
+      if (bl) {
+        goal = bl
+        this.dbg.push("getlaser")
+        if (bd > 30 && me.energy > 40) boost = true
       }
     }
     // grab cubes (and wanted weapons) that are close, whatever we're doing
@@ -954,12 +1195,65 @@ export class Brain implements Bot {
     return best
   }
 
+  // ---- exploration: 40 m cells we've been near, to find weapons on the floor
+  seen = new Uint8Array(32 * 24)
+  explore: number[] | null = null
+  exploreT = -99
+  wantsWeapons(): boolean {
+    if (this.t > TUNE.exploreUntil) return false
+    const w = this.me.weapons
+    const kinds = w.map((x) => x?.kind)
+    if (!TUNE.explore) return false
+    return !(kinds.includes("laser") && (kinds.includes("gun") || kinds.includes("lightning")))
+  }
+  markSeen() {
+    const W = this.W
+    const ci = Math.floor((this.px - W.bminX) / 40),
+      cj = Math.floor((this.py - W.bminY) / 40)
+    for (let dj = -1; dj <= 1; dj++)
+      for (let di = -1; di <= 1; di++) {
+        const i = ci + di,
+          j = cj + dj
+        if (i >= 0 && j >= 0 && i < 32 && j < 24 && Math.abs(di) + Math.abs(dj) <= 1) this.seen[j * 32 + i] = 1
+      }
+  }
+  exploreGoal(sc: number[]): number[] | null {
+    const W = this.W
+    if (this.explore && this.t - this.exploreT < 25 && hyp2(this.px, this.py, this.explore[0], this.explore[1]) > 8) {
+      const c = Math.floor((this.explore[0] - W.bminX) / 40) + Math.floor((this.explore[1] - W.bminY) / 40) * 32
+      if (!this.seen[c]) return this.explore
+    }
+    const here = W.comp[W.cellOf(this.px, this.py)]
+    let best: number[] | null = null
+    let bs = 1e9
+    for (let j = 0; j < 24; j++)
+      for (let i = 0; i < 32; i++) {
+        if (this.seen[j * 32 + i]) continue
+        const x = W.bminX + i * 40 + 20,
+          y = W.bminY + j * 40 + 20
+        if (hyp2(x, y, sc[0], sc[1]) > sc[2] - 30) continue
+        const c = W.nearestNav(x, y, 8, here)
+        if (c < 0) continue
+        let s = hyp2(this.px, this.py, x, y)
+        for (const e of this.tracks.values()) if (e.kind === "mech" && this.t - e.seenT < 30 && hyp2(x, y, e.pos[0], e.pos[1]) < 120) s += 150
+        if (s < bs) {
+          bs = s
+          best = [W.cellX(c), W.cellY(c)]
+        }
+      }
+    this.explore = best
+    this.exploreT = this.t
+    return best
+  }
+
+  memCubes = new Map<number, { id: number; pos: number[]; t: number }>()
+  memPickups = new Map<number, { id: number; kind: string; pos: number[]; t: number }>()
   post: number[] | null = null
   postT = -99
   /** a waiting spot inside the safe circle, next to a wall (no rear hits), with a moderate field of view */
   findPost(sc: number[]): number[] | null {
     const t = this.t
-    if (this.post && t - this.postT < 10 && !this.enemies(1, 150).length && hyp2(this.post[0], this.post[1], sc[0], sc[1]) < sc[2] * 0.7) return this.post
+    if (this.post && t - this.postT < 10 && !this.enemies(1, 150).length && hyp2(this.post[0], this.post[1], sc[0], sc[1]) < sc[2] * (TUNE.postOuter + 0.1)) return this.post
     this.postT = t
     const W = this.W
     const here = W.comp[W.cellOf(this.px, this.py)]
@@ -970,19 +1264,23 @@ export class Brain implements Bot {
       const r = 10 + this.rnd() * 70
       const x = this.px + Math.cos(ang) * r,
         y = this.py + Math.sin(ang) * r
-      if (hyp2(x, y, sc[0], sc[1]) > sc[2] * 0.6) continue
+      const dc = hyp2(x, y, sc[0], sc[1])
+      if (dc > sc[2] * TUNE.postOuter) continue
+      if (dc < sc[2] * TUNE.postInner && sc[2] > 100) continue
       const c = W.cellOf(x, y)
       if (!W.nav[c] || W.comp[c] !== here) continue
       const cl = W.clearAt(x, y)
-      if (cl > 6) continue
+      const sniper = TUNE.openPost && (this.slotOf("laser") >= 0 || TUNE.gunSniper > 0)
+      if (cl > 6 && !sniper) continue
       const z = W.floorAt(x, y) + 6
+      const L = sniper ? 200 : 120
       let open = 0
       for (let k = 0; k < 12; k++) {
         const a2 = (k / 12) * Math.PI * 2
-        open += W.ray(x, y, z, x + Math.cos(a2) * 120, y + Math.sin(a2) * 120, z, 2)
+        open += W.ray(x, y, z, x + Math.cos(a2) * L, y + Math.sin(a2) * L, z, 2)
       }
       open /= 12
-      let s = Math.abs(open - 0.45) * 100 + cl * 4 + r * 0.15 + hyp2(x, y, sc[0], sc[1]) * 0.05
+      let s = sniper ? (1 - open) * 120 + r * 0.15 + hyp2(x, y, sc[0], sc[1]) * 0.05 : Math.abs(open - 0.45) * 100 + cl * 4 + r * 0.15 + hyp2(x, y, sc[0], sc[1]) * 0.05
       for (const e of this.tracks.values()) {
         if (e.kind !== "mech" || t - e.seenT > 40) continue
         const de = hyp2(x, y, e.pos[0], e.pos[1])
@@ -995,6 +1293,39 @@ export class Brain implements Bot {
     }
     if (best) this.post = best
     return this.post
+  }
+
+  kiteT = -99
+  kiteP: number[] | null = null
+  /** a reachable point ~50 m away that maximises distance from the engaged enemies, inside the safe circle */
+  kitePoint(sc: number[]): number[] | null {
+    if (this.kiteP && this.t - this.kiteT < 0.8 && hyp2(this.px, this.py, this.kiteP[0], this.kiteP[1]) > 6) return this.kiteP
+    this.kiteT = this.t
+    const W = this.W
+    const ens = this.enemies(2, 250)
+    const here = W.comp[W.cellOf(this.px, this.py)]
+    let best: number[] | null = null
+    let bs = -1e9
+    for (const r of [25, 50]) {
+      for (let k = 0; k < 16; k++) {
+        const ang = (k / 16) * Math.PI * 2
+        const x = this.px + Math.cos(ang) * r,
+          y = this.py + Math.sin(ang) * r
+        const c = W.cellOf(x, y)
+        if (!W.nav[c] || W.comp[c] !== here) continue
+        if (hyp2(x, y, sc[0], sc[1]) > sc[2] - 15) continue
+        let md = 1e9
+        for (const e of ens) md = Math.min(md, hyp2(x, y, e.pos[0], e.pos[1]))
+        let s = Math.min(md, 250)
+        if (!W.walkable(this.px, this.py, x, y, this.radius)) s -= 25
+        if (s > bs) {
+          bs = s
+          best = [x, y]
+        }
+      }
+    }
+    this.kiteP = best
+    return best
   }
 
   /** nearest point within ~12 m, straight-line walkable, hidden from every mech charging a laser at us */
@@ -1066,11 +1397,12 @@ export class Brain implements Bot {
         best = [x, y]
       }
     }
-    for (const c of obs.cubes) consider(c.pos[0], c.pos[1], c.pos[2], 40)
-    for (const p of obs.pickups) {
+    for (const c of this.memCubes.values()) consider(c.pos[0], c.pos[1], c.pos[2], TUNE.cubeValue)
+    for (const p of this.memPickups.values()) {
       if (this.badPickups.has(p.id)) continue
       const { gain } = this.loadoutGain(p.kind)
-      if (gain > 0) consider(p.pos[0], p.pos[1], p.pos[2], 30 * gain)
+      const hasLaser = this.slotOf("laser") >= 0
+      if (gain > 0) consider(p.pos[0], p.pos[1], p.pos[2], (p.kind === "laser" && !hasLaser ? TUNE.laserLoot : 30) * gain)
     }
     for (const d of obs.drops) {
       if (d.lands_in > 12) continue

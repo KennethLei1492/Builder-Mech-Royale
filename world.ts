@@ -34,6 +34,7 @@ export class World {
   clear: Float32Array
   /** highest solid top at the sample (for roof detection / cover) */
   roof: Float32Array
+  prisms: Prism[] = []
   // nav grid (2 m)
   NS = 2
   gnx: number
@@ -74,7 +75,8 @@ export class World {
     this.hi2 = new Float32Array(N).fill(-INF)
     this.roof = new Float32Array(N).fill(-INF)
     const deck = new Float32Array(N).fill(-INF)
-    for (const p of wj.prisms as Prism[]) this.rasterize(p, deck)
+    this.prisms = wj.prisms as Prism[]
+    for (const p of this.prisms) this.rasterize(p, deck)
     this.floor = new Float32Array(N)
     this.wall = new Uint8Array(N)
     this.computeFloor(deck)
@@ -349,6 +351,42 @@ export class World {
   }
   los(a: number[], b: number[], step = 1) {
     return this.ray(a[0], a[1], a[2], b[0], b[1], b[2], step) >= 1
+  }
+
+  private spots: { x: number; y: number; z: number; g: number }[] | null = null
+  /** flat rooftop standing spots (4 m grid, ≥4 m from any roof edge), roof 6–45 m above the ground */
+  roofSpots(edge = 4.5) {
+    if (this.spots) return this.spots
+    const out: { x: number; y: number; z: number; g: number }[] = []
+    for (const p of this.prisms) {
+      if (p.kind !== "building") continue
+      let x0 = INF, x1 = -INF, y0 = INF, y1 = -INF
+      for (let k = 0; k < p.ring.length; k += 2) {
+        x0 = Math.min(x0, p.ring[k]); x1 = Math.max(x1, p.ring[k])
+        y0 = Math.min(y0, p.ring[k + 1]); y1 = Math.max(y1, p.ring[k + 1])
+      }
+      for (let y = y0 + 2; y < y1; y += 4)
+        for (let x = x0 + 2; x < x1; x += 4) {
+          const k = this.idx(x, y)
+          if (Math.abs(this.roof[k] - p.top) > 0.05 || this.hi1[k] < p.top - 0.05) continue
+          const g = this.ground[k]
+          if (p.top - g < 6 || p.top - g > 45) continue
+          let flat = true
+          for (let a = 0; a < 8 && flat; a++) {
+            const ang = (a / 8) * Math.PI * 2
+            for (const r of [2.5, edge]) {
+              const kk = this.idx(x + Math.cos(ang) * r, y + Math.sin(ang) * r)
+              if (Math.abs(this.roof[kk] - p.top) > 0.3) {
+                flat = false
+                break
+              }
+            }
+          }
+          if (flat) out.push({ x, y, z: p.top, g })
+        }
+    }
+    this.spots = out
+    return out
   }
 
   // ------------------------------------------------------------------ navigation

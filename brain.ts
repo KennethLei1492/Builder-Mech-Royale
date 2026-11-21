@@ -34,6 +34,8 @@ type Track = {
   dmgToMe: number
   /** not actually in view: placed along the bearing of its hits on us */
   phantom?: boolean
+  /** when a beam last gave this phantom an exact position */
+  exactT?: number
 }
 
 type Mode = "zone" | "fight" | "retreat" | "regen" | "loot" | "patrol" | "drop" | "avoid"
@@ -130,6 +132,9 @@ export const TUNE: Record<string, number> = {
   ffaMode: 0,
   treePosts: 0,
   farmClear: 200,
+  openFarm: 40,
+  openFarmR: 150,
+  beamPhantom: 0,
   roofLoot: 0,
   roofLootH: 38,
   spinExplore: 1,
@@ -342,6 +347,24 @@ export class Brain implements Bot {
       const d = hyp2(this.px, this.py, c.pos[0], c.pos[1])
       if (d < 6 || t - c.t > 120 || (d < 40 && this.W.los([this.px, this.py, this.pz + this.eye], [c.pos[0], c.pos[1], c.pos[2] + 0.5]))) this.memCubes.delete(k)
     }
+    // a beam we saw starts at its shooter's muzzle: an exact position for a shooter we cannot see
+    if (this.T.beamPhantom)
+      for (const b of obs.beams) {
+        if (b.by >= 100 || !b.path?.length || obs.mechs.some((m) => m.id === b.by)) continue
+        const o = b.path[0], end = b.path[b.path.length - 1]
+        const tr = this.tracks.get(b.by)
+        const atUs = hyp2(end[0], end[1], this.px, this.py) < 12 || (tr && t - tr.lastHitMeT < 0.3)
+        if (!atUs && !tr?.phantom) continue
+        const pos = [o[0], o[1], o[2] - 7]
+        if (!tr) this.tracks.set(b.by, { id: b.by, kind: "mech", pos, vel: [0, 0, 0], aim: [0, 0], hp: 1400, maxHp: 1400, cubes: 0, weapons: ["gun", b.kind], charging: false, seenT: t, firstT: t, lastHitMeT: atUs ? t : -99, dmgToMe: 0, phantom: true, exactT: t })
+        else if (tr.phantom || t - tr.seenT > 1) {
+          tr.phantom = true
+          tr.pos = pos
+          tr.vel = [0, 0, 0]
+          tr.exactT = t
+          if (atUs) tr.lastHitMeT = t
+        }
+      }
     for (const tr of this.tracks.values()) if (tr.phantom && t - tr.lastHitMeT < this.T.phantomHold) tr.seenT = t
     // forget the dead / very stale
     for (const [id, tr] of this.tracks) if (t - tr.seenT > 60) this.tracks.delete(id)
@@ -367,7 +390,7 @@ export class Brain implements Bot {
               if (!tr) {
                 tr = { id: e.by, kind: "mech", pos, vel: [0, 0, 0], aim: [wrap(e.bearing + Math.PI), 0], hp: 1400, maxHp: 1400, cubes: 0, weapons: wk, charging: false, seenT: t, firstT: t, lastHitMeT: t, dmgToMe: 0, phantom: true }
                 this.tracks.set(e.by, tr)
-              } else if (tr.phantom || t - tr.seenT > 1) {
+              } else if ((tr.phantom || t - tr.seenT > 1) && t - (tr.exactT ?? -99) > 1.5) {
                 tr.phantom = true
                 tr.pos = pos
                 tr.vel = [0, 0, 0]
@@ -1254,6 +1277,22 @@ export class Brain implements Bot {
           if (!goal) {
             const f = this.farmTarget(obs)
             if (f && f.kind === "crate" && hyp2(this.px, this.py, f.pos[0], f.pos[1]) > 35) goal = [f.pos[0], f.pos[1]]
+          }
+          if (!goal && this.T.openFarm && t < this.T.openFarm) {
+            // opening (what the practice leaders do): farm the crates and drones around the spawn first
+            let bf: number[] | null = null
+            let bd = this.T.openFarmR
+            for (const f of this.memFarm.values()) {
+              const d = hyp2(this.px, this.py, f.pos[0], f.pos[1])
+              if (d < bd && this.inSafeZone(f.pos[0], f.pos[1], 12)) {
+                bd = d
+                bf = [f.pos[0], f.pos[1]]
+              }
+            }
+            if (bf && bd > 30) {
+              goal = bf
+              this.dbg.push("openfarm")
+            }
           }
           if (!goal && this.T.farmRun && (!this.T.farmRunNoLaser || this.slotOf("laser") < 0) && me.hp >= me.max_hp * this.T.farmHp) {
             // nobody around: walk to the nearest remembered crate or drone and farm it

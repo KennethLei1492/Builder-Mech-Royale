@@ -37,8 +37,8 @@ type Mode = "zone" | "fight" | "retreat" | "regen" | "loot" | "patrol" | "drop" 
 
 
 const UPGRADE_SCORE: Record<string, number> = {
-  armor: 10,
-  plating: 9.5,
+  armor: 11.8,
+  plating: 12,
   nanites: 7,
   lightning_range: 7.5,
   lightning_efficiency: 6.5,
@@ -84,9 +84,9 @@ export const TUNE: Record<string, number> = {
   dropDist: 0,
   cubeValue: 100,
   cubeRun: 0,
-  postInner: 0,
-  postOuter: 0.6,
-  safeFrac: 0.55,
+  postInner: 0.6,
+  postOuter: 0.88,
+  safeFrac: 0.9,
   spin: 0,
   roof: 0,
   roofDist: 220,
@@ -108,6 +108,9 @@ export const TUNE: Record<string, number> = {
   vMortar: 1.1,
   hpWeight: 70,
   zapReserve: 6,
+  faceIn: 1,
+  sweep: 0.6,
+  wallBack: 60,
 }
 try {
   const env = (globalThis as any).process?.env?.MF_TUNE
@@ -617,6 +620,24 @@ export class Brain implements Bot {
     if (yaw === null && TUNE.spin) {
       // scan: spin the torso; the 120° view wedge then covers every direction every ~1.6 s
       return [wrap(this.me.aim[0] + TUNE.spin), 0]
+    }
+    if (yaw === null && TUNE.faceIn) {
+      // edge play: everyone else is inside the zone, so the front armour arc faces inward
+      let fx = 0,
+        fy = 0
+      for (const tr of this.tracks.values())
+        if (tr.kind === "mech" && t - tr.seenT < 30) {
+          const d = Math.max(20, hyp2(this.px, this.py, tr.pos[0], tr.pos[1]))
+          fx += (tr.pos[0] - this.px) / d / d
+          fy += (tr.pos[1] - this.py) / d / d
+        }
+      let base: number
+      if (fx || fy) base = Math.atan2(fy, fx)
+      else {
+        const sc = this.safeCircle()
+        base = hyp2(this.px, this.py, sc[0], sc[1]) > 15 ? yawTo(this.px, this.py, sc[0], sc[1]) : this.me.aim[0]
+      }
+      return [wrap(base + Math.sin(t * 0.7) * TUNE.sweep), 0]
     }
     if (yaw === null) {
       // scan: sweep around the movement direction
@@ -1272,6 +1293,14 @@ export class Brain implements Bot {
       const cl = W.clearAt(x, y)
       const sniper = TUNE.openPost && (this.slotOf("laser") >= 0 || TUNE.gunSniper > 0)
       if (cl > 6 && !sniper) continue
+      if (TUNE.wallBack && cl > 7) continue
+      let backWall = 0
+      if (TUNE.wallBack) {
+        const dc0 = Math.max(1, hyp2(x, y, sc[0], sc[1]))
+        const ox = (x - sc[0]) / dc0,
+          oy = (y - sc[1]) / dc0
+        for (const k of [4, 7, 10]) if (W.clearAt(x + ox * k, y + oy * k) < 1.2) backWall = 1
+      }
       const z = W.floorAt(x, y) + 6
       const L = sniper ? 200 : 120
       let open = 0
@@ -1281,6 +1310,7 @@ export class Brain implements Bot {
       }
       open /= 12
       let s = sniper ? (1 - open) * 120 + r * 0.15 + hyp2(x, y, sc[0], sc[1]) * 0.05 : Math.abs(open - 0.45) * 100 + cl * 4 + r * 0.15 + hyp2(x, y, sc[0], sc[1]) * 0.05
+      if (TUNE.wallBack && !backWall) s += TUNE.wallBack
       for (const e of this.tracks.values()) {
         if (e.kind !== "mech" || t - e.seenT > 40) continue
         const de = hyp2(x, y, e.pos[0], e.pos[1])

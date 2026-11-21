@@ -75,6 +75,7 @@ export class World {
     this.hi2 = new Float32Array(N).fill(-INF)
     this.roof = new Float32Array(N).fill(-INF)
     const deck = new Float32Array(N).fill(-INF)
+    this.buildTrees(wj)
     this.prisms = wj.prisms as Prism[]
     for (const p of this.prisms) this.rasterize(p, deck)
     this.floor = new Float32Array(N)
@@ -351,6 +352,126 @@ export class World {
   }
   los(a: number[], b: number[], step = 1) {
     return this.ray(a[0], a[1], a[2], b[0], b[1], b[2], step) >= 1
+  }
+
+  // ------------------------------------------------------------------ trees (vision only; shots pass through)
+  /** per tree: x, y, zBase(-1), trunkR, trunkTop, cx, cy, cz, crownR, rz */
+  tree = new Float32Array(0)
+  nTrees = 0
+  private tcell: Int32Array[] = []
+  private tgx0 = 0
+  private tgy0 = 0
+  private tgnx = 0
+  private tgny = 0
+  private tstamp = new Uint32Array(0)
+  private tgen = 1
+  canopyDensity = 0.35
+  canopyBlockT = 0.25
+  private buildTrees(wj: any) {
+    const tr = wj.trees
+    if (!tr?.data) return
+    this.canopyDensity = wj.rules?.canopyDensity ?? 0.35
+    this.canopyBlockT = wj.rules?.canopyBlockT ?? 0.25
+    const F: string[] = tr.fields
+    const ix = (k: string) => F.indexOf(k)
+    const [ax, ay, az, ah, ar, ab, at, acx, acy] = ["x", "y", "z", "height", "crownR", "crownBase", "trunkR", "crownX", "crownY"].map(ix)
+    const n = Math.floor(tr.data.length / F.length)
+    this.nTrees = n
+    this.tree = new Float32Array(n * 10)
+    this.tstamp = new Uint32Array(n)
+    const C = 16
+    this.tgx0 = this.bminX - 32
+    this.tgy0 = this.bminY - 32
+    this.tgnx = Math.ceil((this.bmaxX - this.bminX + 64) / C)
+    this.tgny = Math.ceil((this.bmaxY - this.bminY + 64) / C)
+    const cells: number[][] = Array.from({ length: this.tgnx * this.tgny }, () => [])
+    for (let i = 0; i < n; i++) {
+      const o = i * F.length
+      const d = tr.data
+      const x = d[o + ax], y = d[o + ay], z = d[o + az], h = d[o + ah], r = d[o + ar], b = d[o + ab]
+      const cx = acx >= 0 ? d[o + acx] : x, cy = acy >= 0 ? d[o + acy] : y
+      const T = this.tree, q = i * 10
+      T[q] = x; T[q + 1] = y; T[q + 2] = z - 1; T[q + 3] = d[o + at]
+      T[q + 4] = z + Math.max(b + 0.5 * (h - b), 3)
+      T[q + 5] = cx; T[q + 6] = cy; T[q + 7] = z + (b + h) / 2; T[q + 8] = r; T[q + 9] = Math.max((h - b) / 2, 0.5)
+      const x0 = Math.min(x - d[o + at], cx - r), x1 = Math.max(x + d[o + at], cx + r)
+      const y0 = Math.min(y - d[o + at], cy - r), y1 = Math.max(y + d[o + at], cy + r)
+      for (let J = Math.floor((y0 - this.tgy0) / C); J <= Math.floor((y1 - this.tgy0) / C); J++)
+        for (let I = Math.floor((x0 - this.tgx0) / C); I <= Math.floor((x1 - this.tgx0) / C); I++)
+          if (I >= 0 && J >= 0 && I < this.tgnx && J < this.tgny) cells[J * this.tgnx + I].push(i)
+    }
+    this.tcell = cells.map((c) => Int32Array.from(c))
+  }
+  /**
+   * Foliage on the segment a→b: metres of path inside crowns, or -1 if a trunk blocks it.
+   * The server's rule: visible iff no trunk and exp(-canopyDensity * metres) >= canopyBlockT.
+   */
+  canopy(ax: number, ay: number, az: number, bx: number, by: number, bz: number): number {
+    if (!this.nTrees) return 0
+    const dx = bx - ax, dy = by - ay, dz = bz - az
+    const L = Math.sqrt(dx * dx + dy * dy + dz * dz)
+    if (L < 1e-6) return 0
+    const gen = ++this.tgen
+    const T = this.tree
+    let sum = 0
+    const n = Math.max(1, Math.ceil(Math.hypot(dx, dy) / 6))
+    let lastC = -1
+    for (let s = 0; s <= n; s++) {
+      const f = s / n
+      const I = Math.floor((ax + dx * f - this.tgx0) / 16), J = Math.floor((ay + dy * f - this.tgy0) / 16)
+      if (I < 0 || J < 0 || I >= this.tgnx || J >= this.tgny) continue
+      const c = J * this.tgnx + I
+      if (c === lastC) continue
+      lastC = c
+      const list = this.tcell[c]
+      for (let k = 0; k < list.length; k++) {
+        const i = list[k]
+        if (this.tstamp[i] === gen) continue
+        this.tstamp[i] = gen
+        const q = i * 10
+        // trunk: vertical cylinder
+        {
+          const fx = ax - T[q], fy = ay - T[q + 1]
+          const A = dx * dx + dy * dy
+          if (A > 1e-9) {
+            const B = 2 * (fx * dx + fy * dy), Cc = fx * fx + fy * fy - T[q + 3] * T[q + 3]
+            const disc = B * B - 4 * A * Cc
+            if (disc > 0) {
+              const sq = Math.sqrt(disc)
+              const t0 = Math.max(0, (-B - sq) / (2 * A)), t1 = Math.min(1, (-B + sq) / (2 * A))
+              if (t0 < t1) {
+                const z0 = az + dz * t0, z1 = az + dz * t1
+                if (Math.max(z0, z1) >= T[q + 2] && Math.min(z0, z1) <= T[q + 4]) return -1
+              }
+            }
+          }
+        }
+        // crown: ellipsoid chord
+        const R = T[q + 8], rz = T[q + 9]
+        const c0 = (ax - T[q + 5]) / R, c1 = (ay - T[q + 6]) / R, c2 = (az - T[q + 7]) / rz
+        const d0 = dx / R, d1 = dy / R, d2 = dz / rz
+        const m = d0 * d0 + d1 * d1 + d2 * d2
+        if (m < 1e-12) continue
+        const h = 2 * (c0 * d0 + c1 * d1 + c2 * d2), g = c0 * c0 + c1 * c1 + c2 * c2 - 1
+        const disc = h * h - 4 * m * g
+        if (disc <= 0) continue
+        const v = Math.sqrt(disc)
+        const y0 = (-h - v) / (2 * m), y1 = (-h + v) / (2 * m)
+        if (y1 < 0 || y0 > 1) continue
+        sum += (Math.min(y1, 1) - Math.max(y0, 0)) * L
+      }
+    }
+    return sum
+  }
+  /** maximum metres of foliage a sightline may cross and still see */
+  get canopyMax() {
+    return -Math.log(this.canopyBlockT) / this.canopyDensity
+  }
+  /** true line of sight for vision: buildings/terrain, trunks and foliage */
+  sees(ax: number, ay: number, az: number, bx: number, by: number, bz: number, step = 1): boolean {
+    if (this.ray(ax, ay, az, bx, by, bz, step) < 1) return false
+    const c = this.canopy(ax, ay, az, bx, by, bz)
+    return c >= 0 && c <= this.canopyMax
   }
 
   private spots: { x: number; y: number; z: number; g: number }[] | null = null

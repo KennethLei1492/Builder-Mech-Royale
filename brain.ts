@@ -32,6 +32,8 @@ type Track = {
   firstT: number
   lastHitMeT: number
   dmgToMe: number
+  /** not actually in view: placed along the bearing of its hits on us */
+  phantom?: boolean
 }
 
 type Mode = "zone" | "fight" | "retreat" | "regen" | "loot" | "patrol" | "drop" | "avoid"
@@ -125,6 +127,17 @@ export const TUNE: Record<string, number> = {
   lookBack: 0.6,
   relocate: 0,
   chaseHp: 450,
+  ffaMode: 0,
+  treePosts: 0,
+  phantom: 1,
+  phantomGunD: 90,
+  phantomLaserD: 120,
+  phantomHold: 1.5,
+  treePostGain: 2,
+  treeCover: 1,
+  ffaDetect: 2,
+  ffaLate: 5,
+  ffaSnipeHp: 600,
   packN: 0,
   packR: 220,
   relocDist: 110,
@@ -140,6 +153,9 @@ export function createBot(hello: Hello): Bot {
 }
 
 export class Brain implements Bot {
+  /** per-mech tunables (TUNE merged with tuneLocal); refreshed each decision */
+  T: Record<string, number> = TUNE
+  tuneLocal: Record<string, number> | null = null
   name = "ironclad"
   W: World
   cfg: Hello["config"]
@@ -164,6 +180,13 @@ export class Brain implements Bot {
   dmgWindow: { t: number; amt: number }[] = []
   hitWindow: { t: number; amt: number }[] = []
   unseenT = -99
+  myKills = 0
+  /** free-for-all detected: mechs are dying without us (against the house squad they only die to us) */
+  ffa = false
+  /** FFA and still crowded: lie low, let the others thin each other out, third-party the weak */
+  ffaQuiet = false
+  /** per-mech override of this.T.ffaMode (mixed-lineup evaluation) */
+  ffaEnable: boolean | null = null
   fightPos: number[] | null = null
   fightT = -99
   relocP: number[] | null = null
@@ -200,11 +223,12 @@ export class Brain implements Bot {
     this.slot = hello.slot
     this.rnd = mulberry32(hello.seed ^ 0x9e3779b9)
     this.W = getWorld(hello.map.dir)
-    if (TUNE.roof) this.W.roofSpots(TUNE.roofEdge)
+    if (this.T.roof) this.W.roofSpots(this.T.roofEdge)
   }
 
   // ======================================================================= main
   act(obs: Observation): BotAction {
+    this.T = this.tuneLocal ? { ...TUNE, ...this.tuneLocal } : TUNE
     this.t = obs.t
     this.tick = obs.tick
     this.me = obs.self
@@ -216,6 +240,10 @@ export class Brain implements Bot {
     this.radius = me.stats.radius ?? this.cfg.mech.radius * this.sf
     this.dbg.length = 0
     this.perceive(obs)
+    if (this.ffaEnable ?? !!this.T.ffaMode) {
+      if (16 - obs.alive - this.myKills >= this.T.ffaDetect) this.ffa = true
+      this.ffaQuiet = this.ffa && obs.alive > this.T.ffaLate
+    }
     this.markSeen()
 
     const a: BotAction = {}
@@ -227,7 +255,7 @@ export class Brain implements Bot {
     const aimFire = this.weapons(obs, target, a)
     this.locomotion(obs, target, a)
     if (!aimFire) a.aim = this.idleAim(obs, a)
-    else if (TUNE.lookBack && this.t - this.unseenT < TUNE.lookBack) {
+    else if (this.T.lookBack && this.t - this.unseenT < this.T.lookBack) {
       // an unseen mech is shooting our back: turn to bring it into view (and our front armour round),
       // unless the current target is about to die
       const tg = target
@@ -256,6 +284,7 @@ export class Brain implements Bot {
         tr = { id: m.id, kind: m.kind, pos: m.pos, vel: m.vel, aim: m.aim, hp: m.hp ?? 1400, maxHp: m.max_hp ?? 1400, cubes: m.cubes ?? 0, weapons: m.weapons ?? [], charging: !!m.charging, seenT: t, firstT: t, lastHitMeT: -99, dmgToMe: 0 }
         this.tracks.set(m.id, tr)
       }
+      tr.phantom = false
       tr.pos = m.pos
       tr.vel = m.vel
       tr.aim = m.aim
@@ -287,6 +316,7 @@ export class Brain implements Bot {
       const d = hyp2(this.px, this.py, c.pos[0], c.pos[1])
       if (d < 6 || t - c.t > 120 || (d < 40 && this.W.los([this.px, this.py, this.pz + this.eye], [c.pos[0], c.pos[1], c.pos[2] + 0.5]))) this.memCubes.delete(k)
     }
+    for (const tr of this.tracks.values()) if (tr.phantom && t - tr.lastHitMeT < this.T.phantomHold) tr.seenT = t
     // forget the dead / very stale
     for (const [id, tr] of this.tracks) if (t - tr.seenT > 60) this.tracks.delete(id)
     this.laserThreat = false
@@ -301,7 +331,23 @@ export class Brain implements Bot {
           if (e.bearing !== null) this.lastDamageBearing = e.bearing
           this.lastDamageBy = e.by
           if (e.by !== null) {
-            const tr = this.tracks.get(e.by)
+            let tr = this.tracks.get(e.by)
+            const visible = obs.mechs.some((m) => m.id === e.by)
+            if (this.T.phantom && !visible && e.by < 100 && e.bearing !== null && e.weapon !== "npc") {
+              // shot by a mech we cannot see: assume it sits along the hit bearing at a typical range for the weapon
+              const D = e.weapon === "lightning" ? 30 : e.weapon === "laser" ? this.T.phantomLaserD : this.T.phantomGunD
+              const pos = [this.px + Math.cos(e.bearing) * D, this.py + Math.sin(e.bearing) * D, this.pz]
+              const wk = e.weapon === "gun" ? ["gun"] : ["gun", e.weapon]
+              if (!tr) {
+                tr = { id: e.by, kind: "mech", pos, vel: [0, 0, 0], aim: [wrap(e.bearing + Math.PI), 0], hp: 1400, maxHp: 1400, cubes: 0, weapons: wk, charging: false, seenT: t, firstT: t, lastHitMeT: t, dmgToMe: 0, phantom: true }
+                this.tracks.set(e.by, tr)
+              } else if (tr.phantom || t - tr.seenT > 1) {
+                tr.phantom = true
+                tr.pos = pos
+                tr.vel = [0, 0, 0]
+                tr.aim = [wrap(e.bearing + Math.PI), 0]
+              }
+            }
             if (tr) {
               tr.lastHitMeT = t
               tr.dmgToMe += e.amount
@@ -310,6 +356,7 @@ export class Brain implements Bot {
         }
         this.dmgWindow.push({ t, amt: e.amount })
       } else if (e.type === "kill") {
+        this.myKills++
         const dead = this.tracks.get(e.target)
         if (dead) this.memCubes.set(-5000 - e.target, { id: -1, pos: dead.pos, t })
         if (dead) for (const k of dead.weapons) if (k !== "gun") this.memPickups.set(-1000 - e.target * 4 - this.memPickups.size, { id: -1, kind: k, pos: dead.pos, t })
@@ -392,22 +439,22 @@ export class Brain implements Bot {
       const d = hyp2(this.px, this.py, tr.pos[0], tr.pos[1])
       if (d > 280) continue
       const los = this.canHit(tr)
-      let s = d + (tr.hp / Math.max(1, tr.maxHp)) * TUNE.hpWeight
+      let s = d + (tr.hp / Math.max(1, tr.maxHp)) * this.T.hpWeight
       if (!los) s += 220
       if (this.t - tr.lastHitMeT < 2) s -= 35
       if (tr.id === this.targetId) s -= 30
       if (tr.weapons.includes("laser") && tr.charging) s -= 20
-      if (TUNE.chaseHp && tr.hp < TUNE.chaseHp) s -= 60
+      if (this.T.chaseHp && tr.hp < this.T.chaseHp) s -= 60
       const by = yawTo(this.px, this.py, tr.pos[0], tr.pos[1])
-      if (TUNE.arcPen) {
+      if (this.T.arcPen) {
         // aiming here turns our back on anyone more than 90° away from it (they then hit us at x1.5)
         for (const e of ens) {
           if (e === tr || hyp2(this.px, this.py, e.pos[0], e.pos[1]) > 160) continue
-          if (angDiff(by, yawTo(this.px, this.py, e.pos[0], e.pos[1])) > Math.PI / 2) s += TUNE.arcPen
+          if (angDiff(by, yawTo(this.px, this.py, e.pos[0], e.pos[1])) > Math.PI / 2) s += this.T.arcPen
         }
       }
       // their back is to us: our hits land at x1.5
-      if (TUNE.backBonus && angDiff(tr.aim[0], yawTo(tr.pos[0], tr.pos[1], this.px, this.py)) > Math.PI / 2) s -= TUNE.backBonus
+      if (this.T.backBonus && angDiff(tr.aim[0], yawTo(tr.pos[0], tr.pos[1], this.px, this.py)) > Math.PI / 2) s -= this.T.backBonus
       if (s < bs) {
         bs = s
         best = tr
@@ -424,7 +471,7 @@ export class Brain implements Bot {
   /** NPC or crate to farm when no mech is around */
   farmTarget(obs: Observation): { pos: number[]; id: number; kind: "npc" | "crate"; hp: number } | null {
     if (this.enemies(1.5, 200).length) return null
-    if (this.me.hp < this.me.max_hp * TUNE.farmHp) return null
+    if (this.me.hp < this.me.max_hp * this.T.farmHp) return null
     let best: { pos: number[]; id: number; kind: "npc" | "crate"; hp: number } | null = null
     let bd = 1e9
     for (const m of obs.mechs) {
@@ -559,16 +606,17 @@ export class Brain implements Bot {
     }
     const d = hyp2(this.px, this.py, tgt.pos[0], tgt.pos[1])
     if (this.mode === "avoid" && !this.healthyToSnipe() && !(lw && (lw.charge ?? 0) > 0)) return false
-    if (this.mode === "avoid" && tgt.isMech && d > TUNE.avoidFire && !(lw && (lw.charge ?? 0) > 0)) {
+    if (this.ffaQuiet && this.mode === "avoid" && tgt.isMech && (tgt.tr?.hp ?? 9999) > this.T.ffaSnipeHp && !(lw && (lw.charge ?? 0) > 0)) return false
+    if (this.mode === "avoid" && tgt.isMech && d > this.T.avoidFire && !(lw && (lw.charge ?? 0) > 0)) {
       // not engaged yet: only the laser snipes (outranges everything), the gun stays quiet
-      const gunSnipe = TUNE.gunSniper > 0 && !lw && d < TUNE.gunSniper
-      if (!(TUNE.snipe && lw && lw.cooldown <= 0.05 && d < (lw.stats.range ?? 280) * 0.97) && !gunSnipe) return false
+      const gunSnipe = this.T.gunSniper > 0 && !lw && d < this.T.gunSniper
+      if (!(this.T.snipe && lw && lw.cooldown <= 0.05 && d < (lw.stats.range ?? 280) * 0.97) && !gunSnipe) return false
     }
     const m = this.muzzlePos()
     // primary aim: gun lead if we have a gun, else direct
     const gs = this.slotOf("gun")
     let gw = gs >= 0 ? me.weapons[gs]! : null
-    if (this.mode === "avoid" && d > TUNE.avoidFire && !(TUNE.gunSniper > 0 && !lw && d < TUNE.gunSniper)) gw = null
+    if (this.mode === "avoid" && d > this.T.avoidFire && !(this.T.gunSniper > 0 && !lw && d < this.T.gunSniper)) gw = null
     const gunSpeed = gw?.stats.speed ?? 252
     const [yaw, pitch] = this.leadAim(tgt.pos, tgt.vel, tgt.zOff, gunSpeed, 0.06)
     const direct = [Math.atan2(tgt.pos[1] - m[1], tgt.pos[0] - m[0]), Math.atan2(tgt.pos[2] + tgt.zOff - m[2], Math.max(0.5, d))]
@@ -612,7 +660,7 @@ export class Brain implements Bot {
       const zw = me.weapons[zs]!
       const range = zw.stats.range ?? 45
       const cone = ((zw.stats.cone_deg ?? 30) * Math.PI) / 180 / 2
-      const reserve = this.mode === "retreat" ? 25 : TUNE.zapReserve
+      const reserve = this.mode === "retreat" ? 25 : this.T.zapReserve
       let zapOk = d < range - 1 && angDiff(curYaw, direct[0]) < cone * 0.85
       if (!zapOk)
         for (const e of this.enemies(0.15, range - 1)) {
@@ -670,11 +718,11 @@ export class Brain implements Bot {
     if (t - this.lastDamageT < 3) yaw = this.lastDamageBearing
     else if (recent && t - recent.seenT < 6) yaw = yawTo(this.px, this.py, recent.pos[0], recent.pos[1])
     else if (this.soundHint && t - this.soundHint.t < 3) yaw = this.soundHint.bearing
-    if (yaw === null && TUNE.spin) {
+    if (yaw === null && this.T.spin) {
       // scan: spin the torso; the 120° view wedge then covers every direction every ~1.6 s
-      return [wrap(this.me.aim[0] + TUNE.spin), 0]
+      return [wrap(this.me.aim[0] + this.T.spin), 0]
     }
-    if (yaw === null && TUNE.faceIn) {
+    if (yaw === null && this.T.faceIn) {
       // edge play: everyone else is inside the zone, so the front armour arc faces inward
       let fx = 0,
         fy = 0
@@ -690,7 +738,7 @@ export class Brain implements Bot {
         const sc = this.safeCircle()
         base = hyp2(this.px, this.py, sc[0], sc[1]) > 15 ? yawTo(this.px, this.py, sc[0], sc[1]) : this.me.aim[0]
       }
-      return [wrap(base + Math.sin(t * 0.7) * TUNE.sweep), 0]
+      return [wrap(base + Math.sin(t * 0.7) * this.T.sweep), 0]
     }
     if (yaw === null) {
       // scan: sweep around the movement direction
@@ -724,7 +772,7 @@ export class Brain implements Bot {
 
   // ======================================================================= loot
   wval(kind: string): number {
-    return kind === "lightning" ? TUNE.vLightning : kind === "laser" ? TUNE.vLaser : kind === "gun" ? TUNE.vGun : kind === "mortar" ? TUNE.vMortar : 0
+    return kind === "lightning" ? this.T.vLightning : kind === "laser" ? this.T.vLaser : kind === "gun" ? this.T.vGun : kind === "mortar" ? this.T.vMortar : 0
   }
   loadoutGain(kind: string): { gain: number; drop: number | null } {
     const w = this.me.weapons
@@ -789,7 +837,7 @@ export class Brain implements Bot {
 
   // ======================================================================= intent
   healthyToSnipe(): boolean {
-    return this.me.hp >= this.me.max_hp * TUNE.snipeHp && this.enemies(0.5, 220).length <= TUNE.snipeMaxVis
+    return this.me.hp >= this.me.max_hp * this.T.snipeHp && this.enemies(0.5, 220).length <= this.T.snipeMaxVis
   }
   /** enemies that are actually on us: hit us recently or are close */
   engagedSet(maxD = 130): Track[] {
@@ -797,7 +845,7 @@ export class Brain implements Bot {
     for (const e of this.enemies(0.5, maxD)) {
       const d = hyp2(this.px, this.py, e.pos[0], e.pos[1])
       const closing = (e.vel[0] * (this.px - e.pos[0]) + e.vel[1] * (this.py - e.pos[1])) / Math.max(1, d) > 4
-      if (this.t - e.lastHitMeT < 8 || d < 75 || (closing && d < 110) || (TUNE.chaseHp && e.hp < TUNE.chaseHp && d < 160)) out.push(e)
+      if (this.t - e.lastHitMeT < 8 || d < 75 || (closing && d < 110) || (this.T.chaseHp && e.hp < this.T.chaseHp && d < 160)) out.push(e)
     }
     return out
   }
@@ -821,24 +869,24 @@ export class Brain implements Bot {
     if (eng.length >= 1) {
       const weakest = eng.reduce((a, b) => (a.hp < b.hp ? a : b))
       const finishing = eng.length <= 2 && weakest.hp < 260 && me.hp > 350 && hyp2(this.px, this.py, weakest.pos[0], weakest.pos[1]) < 90
-      if (hpf < TUNE.retreatHp1 && (eng.length >= 2 || eng[0].hp > me.hp * 1.1)) retreat = true
-      if (eng.length >= 3 && hpf < TUNE.retreat3) retreat = true
-      if (eng.length >= 2 && hpf < TUNE.retreat2) retreat = true
-      if (myPower < enemyPower * TUNE.powerRatio) retreat = true
+      if (hpf < this.T.retreatHp1 && (eng.length >= 2 || eng[0].hp > me.hp * 1.1)) retreat = true
+      if (eng.length >= 3 && hpf < this.T.retreat3) retreat = true
+      if (eng.length >= 2 && hpf < this.T.retreat2) retreat = true
+      if (myPower < enemyPower * this.T.powerRatio) retreat = true
       if (finishing && eng.length === 1) retreat = false
-      if (TUNE.noRetreat) retreat = false
+      if (this.T.noRetreat) retreat = false
     } else if (t - this.lastDamageT < 1.5 && hpf < 0.35 && this.lastDamageBy !== null) retreat = true
     // a pack is converging: get out of its sight before it is in range (unless one is already on us up close)
-    if (TUNE.packN && !retreat) {
-      const pack = this.enemies(1.0, TUNE.packR)
+    if (this.T.packN && !retreat) {
+      const pack = this.enemies(1.0, this.T.packR)
       const close = eng.filter((e) => hyp2(this.px, this.py, e.pos[0], e.pos[1]) < 45).length
-      if (pack.length >= TUNE.packN && close === 0) retreat = true
+      if (pack.length >= this.T.packN && close === 0) retreat = true
     }
     if (retreat) mode = "retreat"
     else if (eng.length) mode = "fight"
     else if (near.length) mode = "avoid"
     else if (zoneUrgent) mode = "zone"
-    else if (hpf < TUNE.regenHp && t - this.lastDamageT < 30) mode = "regen"
+    else if (hpf < this.T.regenHp && t - this.lastDamageT < 30) mode = "regen"
     else mode = "patrol"
     if ((mode === "fight" || mode === "avoid") && zoneUrgent && !me.in_zone) mode = "zone"
     if (this.mode === "retreat" && mode !== "retreat" && t - this.modeSince < 1.5 && near.length) mode = "retreat"
@@ -878,12 +926,12 @@ export class Brain implements Bot {
     this.roofPickT = this.t
     let best: { x: number; y: number; z: number; g: number } | null = null
     let bs = 1e9
-    for (const sp of this.W.roofSpots(TUNE.roofEdge)) {
+    for (const sp of this.W.roofSpots(this.T.roofEdge)) {
       const d = hyp2(this.px, this.py, sp.x, sp.y)
-      if (d > TUNE.roofDist) continue
-      if (hyp2(sp.x, sp.y, sc[0], sc[1]) > sc[2] * TUNE.roofZone) continue
+      if (d > this.T.roofDist) continue
+      if (hyp2(sp.x, sp.y, sc[0], sc[1]) > sc[2] * this.T.roofZone) continue
       const hgt = sp.z - Math.max(this.pz, sp.g)
-      if (hgt > TUNE.roofMaxH || hgt < 6) continue
+      if (hgt > this.T.roofMaxH || hgt < 6) continue
       let s = d + Math.abs(hgt - 16) * 2
       for (const e of this.tracks.values()) if (e.kind === "mech" && this.t - e.seenT < 10 && hyp2(sp.x, sp.y, e.pos[0], e.pos[1]) < 60) s += 200
       if (s < bs) {
@@ -901,10 +949,10 @@ export class Brain implements Bot {
   }
   /** returns true when it handled locomotion */
   roofLocomotion(obs: Observation, a: BotAction, sc: number[]): boolean {
-    if (!TUNE.roof) return false // experimental, off by default
+    if (!this.T.roof) return false // experimental, off by default
     const me = this.me
     const hasL = this.slotOf("laser") >= 0
-    if (this.mode === "zone" || (!hasL && TUNE.roof < 2)) {
+    if (this.mode === "zone" || (!hasL && this.T.roof < 2)) {
       if (this.roofT && !this.onRoof()) this.roofT = null
       if (!this.onRoof()) return false
     }
@@ -975,7 +1023,7 @@ export class Brain implements Bot {
     const sc = this.safeCircle()
     const toSafe = () => {
       const d = hyp2(this.px, this.py, sc[0], sc[1])
-      const r = sc[2] * TUNE.safeFrac
+      const r = sc[2] * this.T.safeFrac
       if (d <= r) return null
       const k = r / d
       return [sc[0] + (this.px - sc[0]) * k, sc[1] + (this.py - sc[1]) * k]
@@ -995,13 +1043,13 @@ export class Brain implements Bot {
           uy = (tr.pos[1] - this.py) / Math.max(1, d)
         if (t > this.strafeFlipT) {
           this.strafeSign = this.rnd() < 0.5 ? -1 : 1
-          this.strafeFlipT = t + TUNE.strafeMin + this.rnd() * TUNE.strafeVar
+          this.strafeFlipT = t + this.T.strafeMin + this.rnd() * this.T.strafeVar
         }
         let radial = clamp((d - R) / Math.max(15, R * 0.5), -1, 1)
-        if (TUNE.kite && this.slotOf("laser") >= 0) {
+        if (this.T.kite && this.slotOf("laser") >= 0) {
           let nd = 1e9
-          for (const e of this.enemies(0.5, TUNE.kite + 10)) nd = Math.min(nd, hyp2(this.px, this.py, e.pos[0], e.pos[1]))
-          if (nd < TUNE.kite && nd > TUNE.kiteMin) {
+          for (const e of this.enemies(0.5, this.T.kite + 10)) nd = Math.min(nd, hyp2(this.px, this.py, e.pos[0], e.pos[1]))
+          if (nd < this.T.kite && nd > this.T.kiteMin) {
             const kp = this.kitePoint(sc)
             if (kp) {
               goal = kp
@@ -1013,10 +1061,10 @@ export class Brain implements Bot {
         if (!this.canHit(tr)) {
           // no line of fire: path toward it to get a shot (or wait for it if we hold lightning and it's close)
           goal = [tr.pos[0], tr.pos[1]]
-          if (TUNE.chaseHp && tr.hp < TUNE.chaseHp && me.energy > 25) boost = true
+          if (this.T.chaseHp && tr.hp < this.T.chaseHp && me.energy > 25) boost = true
           break
         }
-        const tang = this.laserThreat ? 1 : TUNE.tang
+        const tang = this.laserThreat ? 1 : this.T.tang
         desire = [ux * radial + -uy * this.strafeSign * tang, uy * radial + ux * this.strafeSign * tang]
         // several on us: back away from the others while we work on this one
         const others = this.engagedSet().filter((e) => e.id !== tr.id)
@@ -1046,7 +1094,7 @@ export class Brain implements Bot {
           if (me.energy > 20) boost = true
         }
         if (radial > 0.6 && this.slotOf("lightning") >= 0 && me.energy > 55 && d < 90) boost = true
-        if (TUNE.fightBoost && me.energy > TUNE.fightBoost) boost = true
+        if (this.T.fightBoost && me.energy > this.T.fightBoost) boost = true
         // keep in the zone
         const dz = hyp2(this.px, this.py, sc[0], sc[1])
         if (dz > sc[2] - 15) {
@@ -1056,7 +1104,7 @@ export class Brain implements Bot {
         break
       }
       case "avoid": {
-        if (TUNE.openPost && (this.slotOf("laser") >= 0 || TUNE.gunSniper > 0) && this.healthyToSnipe()) {
+        if (this.T.openPost && !this.ffaQuiet && (this.slotOf("laser") >= 0 || this.T.gunSniper > 0) && this.healthyToSnipe()) {
           // sniper: hold the open ground and keep our distance while the laser works
           for (const e of this.enemies(0.5, 160)) {
             const d = Math.max(5, hyp2(this.px, this.py, e.pos[0], e.pos[1]))
@@ -1110,17 +1158,17 @@ export class Brain implements Bot {
             goal = this.exploreGoal(sc)
             if (goal) this.dbg.push("explore")
           }
-          if (!goal && TUNE.relocate) {
+          if (!goal && this.T.relocate) {
             const rp = this.relocGoal(sc)
             if (rp) {
               goal = rp
               this.dbg.push("reloc")
             }
           }
-          if (!goal && TUNE.hunt && me.hp > me.max_hp * TUNE.huntHp) {
+          if (!goal && this.T.hunt && me.hp > me.max_hp * this.T.huntHp) {
             // take the fight to them: head for the most recently seen enemy
             let best: Track | null = null
-            for (const e of this.tracks.values()) if (e.kind === "mech" && t - e.seenT < TUNE.hunt && (!best || e.seenT > best.seenT)) best = e
+            for (const e of this.tracks.values()) if (e.kind === "mech" && t - e.seenT < this.T.hunt && (!best || e.seenT > best.seenT)) best = e
             if (best && this.inSafeZone(best.pos[0], best.pos[1], 5)) {
               goal = [best.pos[0], best.pos[1]]
               this.dbg.push("hunt")
@@ -1136,11 +1184,11 @@ export class Brain implements Bot {
       }
     }
     // supply drop: +cubes and a full repair; head there from anything but a close brawl
-    if (TUNE.dropDist > 0 && this.mode !== "zone") {
+    if (this.T.dropDist > 0 && this.mode !== "zone") {
       const closeEng = this.engagedSet(60).length
       for (const d of obs.drops) {
         const dd = hyp2(this.px, this.py, d.pos[0], d.pos[1])
-        if (dd > TUNE.dropDist || closeEng >= 2) continue
+        if (dd > this.T.dropDist || closeEng >= 2) continue
         if (d.holder !== null && d.holder !== this.me.id && d.progress > 1) continue
         const travel = dd / (me.stats.walk_speed ?? 11.7)
         if (travel > d.lands_in + 25) continue
@@ -1153,9 +1201,9 @@ export class Brain implements Bot {
       }
     }
     // cube run between fights
-    if (TUNE.cubeRun && (this.mode === "avoid" || this.mode === "regen") && !this.engagedSet().length) {
+    if (this.T.cubeRun && (this.mode === "avoid" || this.mode === "regen") && !this.engagedSet().length) {
       let bc: number[] | null = null
-      let bd = TUNE.cubeRun
+      let bd = this.T.cubeRun
       for (const c of this.memCubes.values()) {
         if (c.pos[2] > this.W.floorAt(c.pos[0], c.pos[1]) + 2.5 || !this.inSafeZone(c.pos[0], c.pos[1], 8)) continue
         const d = hyp2(this.px, this.py, c.pos[0], c.pos[1])
@@ -1172,7 +1220,7 @@ export class Brain implements Bot {
     // a laser is worth a detour from anything but the zone
     if (this.mode !== "zone" && this.slotOf("laser") < 0) {
       let bl: number[] | null = null
-      let bd = TUNE.laserGrab
+      let bd = this.T.laserGrab
       for (const p of this.memPickups.values()) {
         if (p.kind !== "laser" || this.badPickups.has(p.id) || p.pos[2] > this.W.floorAt(p.pos[0], p.pos[1]) + 2.5 || !this.inSafeZone(p.pos[0], p.pos[1], 8)) continue
         const d = hyp2(this.px, this.py, p.pos[0], p.pos[1])
@@ -1264,10 +1312,10 @@ export class Brain implements Bot {
     const hasL = this.slotOf("lightning") >= 0 && this.me.energy > 12
     const hasLaser = this.slotOf("laser") >= 0
     const hasGun = this.slotOf("gun") >= 0
-    if (hasL) return TUNE.rangeLightning
+    if (hasL) return this.T.rangeLightning
     if (hasLaser && !hasGun) return 120
-    if (hasLaser) return TUNE.rangeLaser
-    return TUNE.rangeGun
+    if (hasLaser) return this.T.rangeLaser
+    return this.T.rangeGun
   }
 
   /** a nearby walkable point out of every known enemy's sight, inside the safe circle */
@@ -1298,7 +1346,11 @@ export class Brain implements Bot {
           const d = hyp2(x, y, e.pos[0], e.pos[1])
           minD = Math.min(minD, d)
           if (d > 230) continue
-          if (W.ray(e.pos[0], e.pos[1], e.pos[2] + 8, x, y, z + 5, 1.5) >= 0.99) exposed++
+          if (W.ray(e.pos[0], e.pos[1], e.pos[2] + 8, x, y, z + 5, 1.5) >= 0.99) {
+            // foliage hides us from sight beyond the 45 m sensors, though not from bullets
+            const c = this.T.treeCover < 1 && d > 50 ? W.canopy(e.pos[0], e.pos[1], e.pos[2] + 8, x, y, z + 5) : 0
+            exposed += c < 0 || c > W.canopyMax ? this.T.treeCover : 1
+          }
         }
         let s = exposed * 120 + r * 0.9 - Math.min(minD, 120) * 0.5
         if (hyp2(x, y, sc[0], sc[1]) > sc[2] - 8) s += 250
@@ -1319,10 +1371,10 @@ export class Brain implements Bot {
   explore: number[] | null = null
   exploreT = -99
   wantsWeapons(): boolean {
-    if (this.t > TUNE.exploreUntil) return false
+    if (this.t > this.T.exploreUntil) return false
     const w = this.me.weapons
     const kinds = w.map((x) => x?.kind)
-    if (!TUNE.explore) return false
+    if (!this.T.explore) return false
     return !(kinds.includes("laser") && (kinds.includes("gun") || kinds.includes("lightning")))
   }
   markSeen() {
@@ -1370,8 +1422,8 @@ export class Brain implements Bot {
   /** after a fight, get well away from where the squad last saw us (their memory of us fades) */
   relocGoal(sc: number[]): number[] | null {
     const t = this.t
-    if (!this.fightPos || t - this.fightT > TUNE.relocate) return null
-    if (hyp2(this.px, this.py, this.fightPos[0], this.fightPos[1]) > TUNE.relocDist) return null
+    if (!this.fightPos || t - this.fightT > this.T.relocate) return null
+    if (hyp2(this.px, this.py, this.fightPos[0], this.fightPos[1]) > this.T.relocDist) return null
     if (this.relocP && this.relocT > this.fightT) return this.relocP
     if (this.busy(15)) return null
     const W = this.W
@@ -1380,8 +1432,8 @@ export class Brain implements Bot {
     let bs = -1e9
     for (let k = 0; k < 16; k++) {
       const ang = (k / 16) * Math.PI * 2
-      const x = this.px + Math.cos(ang) * (TUNE.relocDist + 20),
-        y = this.py + Math.sin(ang) * (TUNE.relocDist + 20)
+      const x = this.px + Math.cos(ang) * (this.T.relocDist + 20),
+        y = this.py + Math.sin(ang) * (this.T.relocDist + 20)
       const c = W.nearestNav(x, y, 6, here)
       if (c < 0) continue
       const cx = W.cellX(c),
@@ -1400,12 +1452,43 @@ export class Brain implements Bot {
     return best
   }
 
+  // ---- tree-aware view score, cached per 6 m cell (-1 = not computed this call: over budget)
+  private vsCache = new Float32Array(180 * 124).fill(-1)
+  private vsBudget = 0
+  private vsTick = -1
+  /** fraction of points 60/120/180 m away (8 directions) we could see from (x,y): buildings, trunks and foliage */
+  viewScore(x: number, y: number): number {
+    const W = this.W
+    const ci = Math.floor((x - W.bminX) / 6), cj = Math.floor((y - W.bminY) / 6)
+    if (ci < 0 || cj < 0 || ci >= 180 || cj >= 124) return 0
+    const k = cj * 180 + ci
+    if (this.vsCache[k] >= 0) return this.vsCache[k]
+    if (this.vsTick !== this.tick) {
+      this.vsTick = this.tick
+      this.vsBudget = 6
+    }
+    if (this.vsBudget <= 0 || this.busy(12)) return -1
+    this.vsBudget--
+    const ez = W.floorAt(x, y) + 8
+    let seen = 0, n = 0
+    for (let a = 0; a < 8; a++) {
+      const ca = Math.cos((a / 8) * Math.PI * 2 + 0.2), sa = Math.sin((a / 8) * Math.PI * 2 + 0.2)
+      for (const d of [60, 120, 180]) {
+        const tx = x + ca * d, ty = y + sa * d
+        n++
+        if (!W.inBounds(tx, ty)) continue
+        if (W.sees(x, y, ez, tx, ty, W.floorAt(tx, ty) + 4.5, 2)) seen++
+      }
+    }
+    return (this.vsCache[k] = seen / n)
+  }
+
   post: number[] | null = null
   postT = -99
   /** a waiting spot inside the safe circle, next to a wall (no rear hits), with a moderate field of view */
   findPost(sc: number[]): number[] | null {
     const t = this.t
-    if (this.post && t - this.postT < 10 && !this.enemies(1, 150).length && hyp2(this.post[0], this.post[1], sc[0], sc[1]) < sc[2] * (TUNE.postOuter + 0.1)) return this.post
+    if (this.post && t - this.postT < 10 && !this.enemies(1, 150).length && hyp2(this.post[0], this.post[1], sc[0], sc[1]) < sc[2] * (this.T.postOuter + 0.1)) return this.post
     this.postT = t
     const W = this.W
     const here = W.comp[W.cellOf(this.px, this.py)]
@@ -1417,16 +1500,16 @@ export class Brain implements Bot {
       const x = this.px + Math.cos(ang) * r,
         y = this.py + Math.sin(ang) * r
       const dc = hyp2(x, y, sc[0], sc[1])
-      if (dc > sc[2] * TUNE.postOuter) continue
-      if (dc < sc[2] * TUNE.postInner && sc[2] > 100) continue
+      if (dc > sc[2] * this.T.postOuter) continue
+      if (dc < sc[2] * this.T.postInner && sc[2] > 100) continue
       const c = W.cellOf(x, y)
       if (!W.nav[c] || W.comp[c] !== here) continue
       const cl = W.clearAt(x, y)
-      const sniper = TUNE.openPost && (this.slotOf("laser") >= 0 || TUNE.gunSniper > 0)
+      const sniper = this.T.openPost && !this.ffaQuiet && (this.slotOf("laser") >= 0 || this.T.gunSniper > 0)
       if (cl > 6 && !sniper) continue
-      if (TUNE.wallBack && cl > 7) continue
+      if (this.T.wallBack && cl > 7) continue
       let backWall = 0
-      if (TUNE.wallBack) {
+      if (this.T.wallBack) {
         const dc0 = Math.max(1, hyp2(x, y, sc[0], sc[1]))
         const ox = (x - sc[0]) / dc0,
           oy = (y - sc[1]) / dc0
@@ -1435,13 +1518,20 @@ export class Brain implements Bot {
       const z = W.floorAt(x, y) + 6
       const L = sniper ? 200 : 120
       let open = 0
-      for (let k = 0; k < 12; k++) {
-        const a2 = (k / 12) * Math.PI * 2
-        open += W.ray(x, y, z, x + Math.cos(a2) * L, y + Math.sin(a2) * L, z, 2)
+      if (this.T.treePosts && sniper) {
+        // what we would really see from here (trees included)
+        const vs = this.viewScore(x, y)
+        if (vs < 0) continue
+        open = Math.min(1, vs * this.T.treePostGain)
+      } else {
+        for (let k = 0; k < 12; k++) {
+          const a2 = (k / 12) * Math.PI * 2
+          open += W.ray(x, y, z, x + Math.cos(a2) * L, y + Math.sin(a2) * L, z, 2)
+        }
+        open /= 12
       }
-      open /= 12
       let s = sniper ? (1 - open) * 120 + r * 0.15 + hyp2(x, y, sc[0], sc[1]) * 0.05 : Math.abs(open - 0.45) * 100 + cl * 4 + r * 0.15 + hyp2(x, y, sc[0], sc[1]) * 0.05
-      if (TUNE.wallBack && !backWall) s += TUNE.wallBack
+      if (this.T.wallBack && !backWall) s += this.T.wallBack
       for (const e of this.tracks.values()) {
         if (e.kind !== "mech" || t - e.seenT > 40) continue
         const de = hyp2(x, y, e.pos[0], e.pos[1])
@@ -1460,11 +1550,11 @@ export class Brain implements Bot {
   tac = -1
   tacUntil = -99
   onTactic: ((t: number, f: number[], a: number) => void) | null = null
-  /** per-mech override of TUNE.learn (self-play evaluation mixes learned and hand-written bots) */
+  /** per-mech override of this.T.learn (self-play evaluation mixes learned and hand-written bots) */
   useLearn: boolean | null = null
   tactic(obs: Observation, target: Track | null): number {
-    const learn = this.useLearn ?? !!TUNE.learn
-    const explore = this.useLearn === false ? 0 : TUNE.tacExplore
+    const learn = this.useLearn ?? !!this.T.learn
+    const explore = this.useLearn === false ? 0 : this.T.tacExplore
     if (!explore && !learn) return -1
     const ens = this.enemies(1.0, 250)
     if (!ens.length || this.mode === "zone") {
@@ -1475,9 +1565,9 @@ export class Brain implements Bot {
     const f = this.features(obs, ens, target)
     let a = 0
     if (explore && this.rnd() < explore) a = Math.floor(this.rnd() * 4)
-    else if (learn) a = chooseTactic(f, TUNE.lambda, TUNE.mu, TUNE.usePts, TUNE.margin)
+    else if (learn) a = chooseTactic(f, this.T.lambda, this.T.mu, this.T.usePts, this.T.margin)
     this.tac = a
-    this.tacUntil = this.t + TUNE.tacHold
+    this.tacUntil = this.t + this.T.tacHold
     this.onTactic?.(this.t, f, a)
     return a
   }
@@ -1593,7 +1683,7 @@ export class Brain implements Bot {
 
   nearGrab(obs: Observation): number[] | null {
     let best: number[] | null = null
-    let bd = TUNE.grabDist
+    let bd = this.T.grabDist
     const ok = (x: number, y: number, z: number) => z <= this.W.floorAt(x, y) + 2.5 && this.W.walkable(this.px, this.py, x, y, this.radius)
     for (const c of obs.cubes) {
       const d = hyp2(this.px, this.py, c.pos[0], c.pos[1])
@@ -1626,12 +1716,12 @@ export class Brain implements Bot {
         best = [x, y]
       }
     }
-    for (const c of this.memCubes.values()) consider(c.pos[0], c.pos[1], c.pos[2], TUNE.cubeValue)
+    for (const c of this.memCubes.values()) consider(c.pos[0], c.pos[1], c.pos[2], this.T.cubeValue)
     for (const p of this.memPickups.values()) {
       if (this.badPickups.has(p.id)) continue
       const { gain } = this.loadoutGain(p.kind)
       const hasLaser = this.slotOf("laser") >= 0
-      if (gain > 0) consider(p.pos[0], p.pos[1], p.pos[2], (p.kind === "laser" && !hasLaser ? TUNE.laserLoot : 30) * gain)
+      if (gain > 0) consider(p.pos[0], p.pos[1], p.pos[2], (p.kind === "laser" && !hasLaser ? this.T.laserLoot : 30) * gain)
     }
     for (const d of obs.drops) {
       if (d.lands_in > 12) continue

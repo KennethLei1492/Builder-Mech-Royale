@@ -134,6 +134,17 @@ export const TUNE: Record<string, number> = {
   treePosts: 0,
   farmClear: 200,
   openFarm: 0,
+  laserContest: 0,
+  reloadIdle: 0.6,
+  reloadLull: 0,
+  gunMoveRange: 175,
+  chaseFar: 0,
+  regenExplore: 0,
+  seenRay: 0,
+  roofMemFix: 0,
+  crateAimFix: 1,
+  laserCover: 0,
+  laserCoverClose: 55,
   droneDefense: 1,
   lootHurt: 0,
   paceHp: 0,
@@ -313,7 +324,10 @@ export class Brain implements Bot {
     const g = this.slotOf("gun")
     if (g >= 0) {
       const w = me.weapons[g]!
-      if (!target && (w.reload ?? 0) === 0 && (w.ammo ?? 0) < (w.stats.mag ?? 12) * 0.6) a.reload = true
+      const mag = w.stats.mag ?? 12
+      if (!target && (w.reload ?? 0) === 0 && (w.ammo ?? 0) < mag * this.T.reloadIdle) a.reload = true
+      // a lull in the fight (no line of fire to the target): reload a half-empty magazine now, not when it matters
+      else if (this.T.reloadLull && target && !this.canHit(target) && (w.reload ?? 0) === 0 && (w.ammo ?? 0) < mag * this.T.reloadLull) a.reload = true
     }
     draw.label(`${this.mode} hp${Math.round(me.hp)} e${Math.round(me.energy)} ${target ? "T" + target.id : ""} ${this.dbg.join(" ")}`.slice(0, 78))
     return a
@@ -348,7 +362,8 @@ export class Brain implements Bot {
     for (const [k, p] of this.memPickups) {
       if (visIds.has(k)) continue
       const d = hyp2(this.px, this.py, p.pos[0], p.pos[1])
-      if (d < 25 || (k < 0 && t - p.t > 90) || (d < 45 && this.W.los([this.px, this.py, this.pz + this.eye], [p.pos[0], p.pos[1], p.pos[2] + 0.5]))) this.memPickups.delete(k)
+      const onRoofP = this.T.roofMemFix && p.pos[2] > this.W.floorAt(p.pos[0], p.pos[1]) + 2.5 && this.pz < p.pos[2] - 2
+      if ((d < 25 && !onRoofP) || (k < 0 && t - p.t > 90) || (d < 45 && this.W.los([this.px, this.py, this.pz + this.eye], [p.pos[0], p.pos[1], p.pos[2] + 0.5]))) this.memPickups.delete(k)
     }
     // crates and drones we have seen: farmable later (cubes = max HP, damage, upgrades)
     const visFarm = new Set<number>()
@@ -395,6 +410,13 @@ export class Brain implements Bot {
         }
       }
     for (const tr of this.tracks.values()) if (tr.phantom && t - tr.lastHitMeT < this.T.phantomHold) tr.seenT = t
+    if (this.T.laserContest)
+      for (const [k, p] of this.memPickups)
+        for (const e of this.tracks.values())
+          if (e.kind === "mech" && t - e.seenT < 0.3 && e.weapons.includes(p.kind) && hyp2(e.pos[0], e.pos[1], p.pos[0], p.pos[1]) < 15) {
+            this.memPickups.delete(k)
+            break
+          }
     // forget the dead / very stale
     for (const [id, tr] of this.tracks) if (t - tr.seenT > 60) this.tracks.delete(id)
     this.laserThreat = false
@@ -591,7 +613,7 @@ export class Brain implements Bot {
       const m = this.muzzlePos()
       if (this.W.ray(m[0], m[1], m[2], c.pos[0], c.pos[1], c.pos[2] + 1.2, 1) < 0.97) continue
       bd = d + 15
-      best = { pos: [c.pos[0], c.pos[1], c.pos[2] - 3.3], id: c.id, kind: "crate", hp: c.hp ?? 300 }
+      best = { pos: this.T.crateAimFix ? [c.pos[0], c.pos[1], c.pos[2]] : [c.pos[0], c.pos[1], c.pos[2] - 3.3], id: c.id, kind: "crate", hp: c.hp ?? 300 }
     }
     return best
   }
@@ -690,7 +712,7 @@ export class Brain implements Bot {
       const f = this.farmTarget(obs)
       if (f) {
         const tr = f.kind === "npc" ? this.tracks.get(f.id) ?? null : null
-        tgt = { pos: f.pos, vel: tr ? tr.vel : [0, 0, 0], zOff: f.kind === "npc" ? 1.75 : 4.5, id: f.id, isMech: false, tr }
+        tgt = { pos: f.pos, vel: tr ? tr.vel : [0, 0, 0], zOff: f.kind === "npc" ? 1.75 : this.T.crateAimFix ? (this.cfg.crates.height ?? 2.4) * 0.5 : 4.5, id: f.id, isMech: false, tr }
         this.crateTarget = f.id
       }
     }
@@ -774,7 +796,7 @@ export class Brain implements Bot {
     const maxTurn = (me.stats.turn_rate ?? 4) * 0.1
     // gun
     const slowTarget = Math.hypot(tgt.vel[0], tgt.vel[1]) < 3
-    const gunRange = Math.min((gw?.stats.range ?? 230) * 0.98, slowTarget ? 1e9 : 175)
+    const gunRange = Math.min((gw?.stats.range ?? 230) * 0.98, slowTarget ? 1e9 : this.T.gunMoveRange)
     if (gw && (gw.reload ?? 0) === 0 && (gw.ammo ?? 1) > 0 && d < gunRange) {
       const e1 = angDiff(curYaw, yaw)
       if (e1 < tolYaw + maxTurn * 0.15 && Math.abs(curPitch - pitch) < tolYaw * 2 + 0.05) fire[gs] = true
@@ -981,8 +1003,9 @@ export class Brain implements Bot {
   }
   engagedSet(maxD = 130): Track[] {
     const out: Track[] = []
-    for (const e of this.enemies(0.5, maxD)) {
+    for (const e of this.enemies(0.5, Math.max(maxD, this.T.chaseFar))) {
       const d = hyp2(this.px, this.py, e.pos[0], e.pos[1])
+      if (d > maxD && !(this.T.chaseHp && e.hp < this.T.chaseHp && d < this.T.chaseFar)) continue
       const closing = (e.vel[0] * (this.px - e.pos[0]) + e.vel[1] * (this.py - e.pos[1])) / Math.max(1, d) > 4
       if (this.pacing()) {
         if (this.t - e.lastHitMeT < 6 || d < 50) out.push(e)
@@ -1036,6 +1059,8 @@ export class Brain implements Bot {
     else if (hpf < this.T.regenHp && t - this.lastDamageT < 30) mode = "regen"
     else mode = "patrol"
     if ((mode === "fight" || mode === "avoid") && zoneUrgent && !me.in_zone) mode = "zone"
+    // HP regenerates while walking too: without a laser, spend the regen time searching instead of sitting in cover
+    if (mode === "regen" && this.T.regenExplore && this.slotOf("laser") < 0 && this.wantsWeapons()) mode = "patrol"
     if (this.mode === "retreat" && mode !== "retreat" && t - this.modeSince < 1.5 && near.length) mode = "retreat"
     if (mode !== this.mode) {
       this.mode = mode
@@ -1282,6 +1307,18 @@ export class Brain implements Bot {
             }
           }
         }
+        if (this.T.laserCover && this.slotOf("laser") < 0 && d > this.T.laserCoverClose && tr.hp > 260) {
+          // gun-only in a laser crossfire at range: we lose the trade, get out of their sight
+          const lz = this.enemies(0.5, 160).filter((e) => e.weapons.includes("laser"))
+          if (lz.length >= this.T.laserCover) {
+            const cp = this.findCover(sc)
+            if (cp && hyp2(this.px, this.py, cp[0], cp[1]) > 3) {
+              goal = cp
+              this.dbg.push("lcover")
+              break
+            }
+          }
+        }
         if (!this.canHit(tr)) {
           // no line of fire: path toward it to get a shot (or wait for it if we hold lightning and it's close)
           goal = [tr.pos[0], tr.pos[1]]
@@ -1501,6 +1538,13 @@ export class Brain implements Bot {
       let bd = this.T.laserGrab
       for (const p of this.memPickups.values()) {
         if (p.kind !== "laser" || this.badPickups.has(p.id) || p.pos[2] > this.W.floorAt(p.pos[0], p.pos[1]) + 2.5 || !this.inSafeZone(p.pos[0], p.pos[1], 8)) continue
+        if (this.T.laserContest) {
+          // an enemy beside it will take it first (or already did): don't run into it with just a gun
+          let contested = false
+          for (const e of this.tracks.values())
+            if (e.kind === "mech" && this.t - e.seenT < 3 && hyp2(e.pos[0], e.pos[1], p.pos[0], p.pos[1]) < this.T.laserContest) contested = true
+          if (contested) continue
+        }
         const d = hyp2(this.px, this.py, p.pos[0], p.pos[1])
         if (d < bd) {
           bd = d
@@ -1669,6 +1713,7 @@ export class Brain implements Bot {
 
   // ---- exploration: 40 m cells we've been near, to find weapons on the floor
   seen = new Uint8Array(32 * 24)
+  seenRayT = -99
   explore: number[] | null = null
   exploreT = -99
   wantsWeapons(): boolean {
@@ -1688,6 +1733,21 @@ export class Brain implements Bot {
           j = cj + dj
         if (i >= 0 && j >= 0 && i < 32 && j < 24 && Math.abs(di) + Math.abs(dj) <= 1) this.seen[j * 32 + i] = 1
       }
+    // cells we actually looked into (in the torso's field of view, line of sight to their centre)
+    if (this.T.seenRay && this.t - this.seenRayT > 0.5 && !this.busy(this.T.budgetSearch)) {
+      this.seenRayT = this.t
+      const R = this.T.seenRay, eye = this.pz + 7, yaw = this.me.aim[0]
+      const r = Math.ceil(R / 40)
+      for (let dj = -r; dj <= r; dj++)
+        for (let di = -r; di <= r; di++) {
+          const i = ci + di, j = cj + dj
+          if (i < 0 || j < 0 || i >= 32 || j >= 24 || this.seen[j * 32 + i]) continue
+          const x = W.bminX + i * 40 + 20, y = W.bminY + j * 40 + 20
+          const d = hyp2(this.px, this.py, x, y)
+          if (d > R || angDiff(yaw, yawTo(this.px, this.py, x, y)) > 1.0) continue
+          if (W.sees(this.px, this.py, eye, x, y, W.floorAt(x, y) + 1.5, 2)) this.seen[j * 32 + i] = 1
+        }
+    }
   }
   exploreGoal(sc: number[]): number[] | null {
     const W = this.W

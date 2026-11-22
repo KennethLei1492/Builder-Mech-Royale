@@ -42,29 +42,32 @@ type Track = {
 type Mode = "zone" | "fight" | "retreat" | "regen" | "loot" | "patrol" | "drop" | "avoid"
 
 
+// measured: each upgrade granted at spawn, 1,000 sim matches per upgrade over the 5 calibrated house configs
+// (gain vs none: gun_mag +0.75, plating +0.50, sensors +0.37, gun_damage +0.33, nanites +0.31, laser_charge +0.28,
+// armor +0.27, laser_pierce +0.20, laser_damage +0.16, ..., reactor -0.10, gyros -0.11)
 const UPGRADE_SCORE: Record<string, number> = {
-  armor: 11.8,
+  gun_mag: 15,
   plating: 12,
-  nanites: 7,
-  lightning_range: 7.5,
-  lightning_efficiency: 6.5,
-  lightning_chain: 4,
-  laser_charge: 10.5,
-  laser_damage: 11,
-  laser_pierce: 2,
-  gun_rate: 6.5,
-  gun_damage: 6.5,
-  gun_velocity: 5,
-  gun_mag: 5,
-  gyros: 5.5,
-  servos: 5,
-  sensors: 4.5,
-  capacitor: 4,
-  reactor: 4,
-  jets: 3.5,
+  sensors: 10,
+  gun_damage: 9.5,
+  nanites: 9,
+  laser_charge: 8.5,
+  armor: 8,
+  laser_pierce: 7,
+  laser_damage: 6.5,
+  lightning_efficiency: 5,
+  jets: 4.5,
+  lightning_range: 4.5,
+  gun_rate: 4.5,
+  servos: 4.5,
+  gun_velocity: 3,
+  capacitor: 3,
+  lightning_chain: 3,
   mortar_reload: 2,
   mortar_splash: 2,
   mortar_velocity: 2,
+  reactor: 1,
+  gyros: 0.5,
 }
 
 /** tunables (overridable for local experiments via MF_TUNE='{"k":v}') */
@@ -126,7 +129,7 @@ export const TUNE: Record<string, number> = {
   margin: 1.0,
   hunt: 0,
   arcPen: 0,
-  backBonus: 30,
+  backBonus: 70,
   lookBack: 0.6,
   relocate: 0,
   chaseHp: 450,
@@ -145,6 +148,16 @@ export const TUNE: Record<string, number> = {
   kiteBoost: 40,
   kiteBoostCharge: 0,
   kiteGun: 0,
+  roofScout: 0,
+  cookPref: 0,
+  jumpDodge: 0,
+  jumpThreat: 0,
+  kiteLos: 40,
+  kiteFar: 0,
+  scoutUntil: 30,
+  scoutLook: 2.5,
+  scoutMinH: 8,
+  scoutAfter: 0,
   seenRay: 0,
   roofMemFix: 0,
   crateAimFix: 1,
@@ -554,6 +567,8 @@ export class Brain implements Bot {
       if (this.t - tr.lastHitMeT < 2) s -= 35
       if (tr.id === this.targetId) s -= 30
       if (tr.weapons.includes("laser") && tr.charging) s -= 20
+      // laser hits on a mortar carrier cook off (+60%)
+      if (this.T.cookPref && tr.weapons.includes("mortar") && this.slotOf("laser") >= 0) s -= this.T.cookPref
       if (this.T.laserTarget && tr.weapons.includes("laser") && this.slotOf("laser") < 0) s -= this.T.laserTarget
       if (this.T.chaseHp && tr.hp < this.T.chaseHp) s -= 60
       const by = yawTo(this.px, this.py, tr.pos[0], tr.pos[1])
@@ -1188,6 +1203,91 @@ export class Brain implements Bot {
     return true
   }
 
+  // ---- rooftop scout: early, without a laser, climb a nearby roof and look around (lasers on roofs and far
+  // ground are hidden from street level; from 10-25 m up a laser is in view in most matches)
+  scoutT: { x: number; y: number; z: number } | null = null
+  scoutBase: number[] | null = null
+  scoutPhase = ""
+  scoutDone = false
+  scoutOnT = -1
+  scoutStart = -1
+  roofScoutLocomotion(a: BotAction, sc: number[]): boolean {
+    if (!this.T.roofScout || this.scoutDone) return false
+    const me = this.me
+    const W = this.W
+    const stop = () => {
+      this.scoutDone = true
+      this.scoutT = null
+      return false
+    }
+    if (this.t > this.T.scoutUntil + 15 || this.slotOf("laser") >= 0) return stop()
+    let knowLaser = false
+    for (const p of this.memPickups.values()) if (p.kind === "laser" && !this.badPickups.has(p.id) && this.inSafeZone(p.pos[0], p.pos[1], 8)) knowLaser = true
+    if (knowLaser) return stop()
+    const climbing = this.scoutPhase === "climb" || this.scoutPhase === "on"
+    if (!climbing && (this.engagedSet().length || this.mode === "zone")) return false
+    if (!this.scoutT && this.t < this.T.scoutAfter) return false
+    if (!this.scoutT) {
+      if (this.t > this.T.scoutUntil) return stop()
+      const here = W.comp[W.cellOf(this.px, this.py)]
+      let best: { x: number; y: number; z: number } | null = null
+      let bs = 1e9
+      for (const sp of W.roofSpots(this.T.roofEdge)) {
+        const d = hyp2(this.px, this.py, sp.x, sp.y)
+        if (d > this.T.roofScout) continue
+        const hgt = sp.z - sp.g
+        if (hgt < this.T.scoutMinH || hgt > 28 || sp.z - this.pz > 30) continue
+        if (!this.inSafeZone(sp.x, sp.y, 20)) continue
+        const s0 = d - hgt * 2
+        if (s0 >= bs) continue
+        const c = W.nearestNav(sp.x, sp.y, 15, here)
+        if (c < 0) continue
+        bs = s0
+        best = { x: sp.x, y: sp.y, z: sp.z }
+        this.scoutBase = [W.cellX(c), W.cellY(c)]
+      }
+      if (!best) return stop()
+      this.scoutT = best
+      this.scoutPhase = "approach"
+      this.scoutStart = this.t
+    }
+    const T = this.scoutT
+    if (this.t - this.scoutStart > 25) return stop()
+    const dT = hyp2(this.px, this.py, T.x, T.y)
+    if (this.onRoof() && this.pz > T.z - 2) {
+      if (this.scoutPhase !== "on") {
+        this.scoutPhase = "on"
+        this.scoutOnT = this.t
+      }
+      a.move = dT > 2 ? [((T.x - this.px) / dT) * 0.5, ((T.y - this.py) / dT) * 0.5] : [0, 0]
+      this.dbg.push("scout")
+      if (this.t - this.scoutOnT > this.T.scoutLook) return stop()
+      return true
+    }
+    const base = this.scoutBase!
+    const dB = hyp2(this.px, this.py, base[0], base[1])
+    const need = ((T.z - this.pz + 2) / 10) * (me.stats.jet_drain ?? 15) + 12
+    if (this.scoutPhase === "approach") {
+      if (dB < 5 && me.energy >= Math.min(need, (me.max_energy ?? 100) - 2)) this.scoutPhase = "climb"
+      else {
+        const wp = this.followPath(base)
+        if (wp && dB >= 5) {
+          const d = hyp2(this.px, this.py, wp[0], wp[1])
+          a.move = this.steer((wp[0] - this.px) / Math.max(0.01, d), (wp[1] - this.py) / Math.max(0.01, d))
+          if (dB > 30 && me.energy > 60) a.boost = true
+        } else a.move = [0, 0]
+        this.dbg.push("toscout")
+        return true
+      }
+    }
+    a.move = [(T.x - this.px) / Math.max(0.01, dT), (T.y - this.py) / Math.max(0.01, dT)]
+    if (me.grounded && this.pz < T.z - 1) a.jump = true
+    a.boost = this.pz < T.z + 1.5 && me.energy > 1
+    if (me.grounded && this.pz < T.z - 1 && me.energy < 5) return stop() // could not make the climb
+    this.dbg.push("scoutclimb")
+    return true
+  }
+
   // ---- rooftop loot: a quarter of the floor weapons lie on roofs; jump-jet up for a laser we know about
   lootRoof: { x: number; y: number; z: number; id: number; kind: string } | null = null
   lootRoofBase: number[] | null = null
@@ -1265,6 +1365,7 @@ export class Brain implements Bot {
       const sc0 = this.safeCircle()
       if (this.roofLocomotion(obs, a, sc0)) return
       if (this.roofLootLocomotion(a, sc0)) return
+      if (this.roofScoutLocomotion(a, sc0)) return
     }
     let goal: number[] | null = null
     let desire: number[] = [0, 0] // local steering intent (unit-ish), used when no path goal
@@ -1659,6 +1760,13 @@ export class Brain implements Bot {
       a.jump = me.grounded
       boost = me.energy > 8
       a.move = [Math.cos(this.unstickDir), Math.sin(this.unstickDir)]
+    }
+    // hop in fights: house shooters only partly lead vertical motion
+    if (me.grounded && (this.mode === "fight" || this.mode === "retreat") && this.engagedSet().length) {
+      const lw1 = this.slotOf("laser") >= 0 ? me.weapons[this.slotOf("laser")] : null
+      const charging = (lw1?.charge ?? 0) > 0
+      if (this.T.jumpThreat && this.laserThreat && !charging) a.jump = true
+      if (this.T.jumpDodge && !charging && this.rnd() < this.T.jumpDodge) a.jump = true
     }
     a.boost = boost
   }
@@ -2070,7 +2178,8 @@ export class Brain implements Bot {
     const here = W.comp[W.cellOf(this.px, this.py)]
     let best: number[] | null = null
     let bs = -1e9
-    for (const r of [25, 50]) {
+    const tgt = this.targetId >= 0 ? this.tracks.get(this.targetId) : undefined
+    for (const r of this.T.kiteFar ? [25, 50, this.T.kiteFar] : [25, 50]) {
       for (let k = 0; k < 16; k++) {
         const ang = (k / 16) * Math.PI * 2
         const x = this.px + Math.cos(ang) * r,
@@ -2082,6 +2191,8 @@ export class Brain implements Bot {
         for (const e of ens) md = Math.min(md, hyp2(x, y, e.pos[0], e.pos[1]))
         let s = Math.min(md, 250)
         if (!W.walkable(this.px, this.py, x, y, this.radius)) s -= 25
+        // keep the laser's line to the target from the new spot
+        if (this.T.kiteLos && tgt && W.ray(x, y, W.floorAt(x, y) + this.muzzle, tgt.pos[0], tgt.pos[1], tgt.pos[2] + 4, 2) >= 0.97) s += this.T.kiteLos
         if (s > bs) {
           bs = s
           best = [x, y]

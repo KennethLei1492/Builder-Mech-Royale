@@ -154,6 +154,8 @@ export const TUNE: Record<string, number> = {
   jumpThreat: 0,
   kiteLos: 40,
   kiteFar: 0,
+  crateHunt: 200,
+  crateHuntHp: 0.5,
   scoutUntil: 30,
   scoutLook: 2.5,
   scoutMinH: 8,
@@ -611,8 +613,9 @@ export class Brain implements Bot {
       }
       if (best) return { pos: best.pos, id: best.id, kind: "npc", hp: best.hp ?? 350 }
     }
-    if (this.enemies(1.5, this.T.farmClear).length) return null
-    if (this.me.hp < this.me.max_hp * this.T.farmHp) return null
+    const hunting = this.T.crateHunt && this.slotOf("laser") < 0 && this.t < this.T.exploreUntil && !this.engagedSet().length && this.me.hp >= this.me.max_hp * this.T.crateHuntHp
+    if (!hunting && this.enemies(1.5, this.T.farmClear).length) return null
+    if (!hunting && this.me.hp < this.me.max_hp * this.T.farmHp) return null
     if (this.pacing()) return null
     let best: { pos: number[]; id: number; kind: "npc" | "crate"; hp: number } | null = null
     let bd = 1e9
@@ -725,6 +728,11 @@ export class Brain implements Bot {
     const curYaw = me.aim[0],
       curPitch = me.aim[1]
     let tgt: { pos: number[]; vel: number[]; zOff: number; id: number; isMech: boolean; tr: Track | null } | null = null
+    // without a laser, a crate beats sniping at a mech that is not on us (cube + 1-in-6 laser)
+    if (target && this.T.crateHunt && this.slotOf("laser") < 0 && !this.engagedSet().some((e) => e.id === target.id)) {
+      const f = this.farmTarget(obs)
+      if (f && f.kind === "crate") target = null
+    }
     if (target && this.canHit(target)) {
       const c = this.centerOf(target)
       tgt = { pos: target.pos, vel: target.vel, zOff: c[2] - target.pos[2], id: target.id, isMech: true, tr: target }
@@ -1476,6 +1484,13 @@ export class Brain implements Bot {
         break
       }
       case "avoid": {
+        {
+          const ch = this.crateHuntGoal(sc)
+          if (ch) {
+            goal = ch
+            break
+          }
+        }
         if (this.T.exploreAvoid && this.wantsWeapons()) {
           // enemies in sight but none on us: keep looking for a laser rather than holding still
           const g = this.lootGoal(obs, sc) ?? this.exploreGoal(sc)
@@ -1576,6 +1591,7 @@ export class Brain implements Bot {
               }
             }
           }
+          if (!goal) goal = this.crateHuntGoal(sc)
           if (!goal && this.wantsWeapons()) {
             goal = this.exploreGoal(sc)
             if (goal) {
@@ -1895,6 +1911,23 @@ export class Brain implements Bot {
       }
     this.explore = best
     this.exploreT = this.t
+    return best
+  }
+
+  /** without a laser: the nearest remembered ground crate (1 cube, and a 1-in-6 laser) */
+  crateHuntGoal(sc: number[]): number[] | null {
+    if (!this.T.crateHunt || this.slotOf("laser") >= 0 || this.t > this.T.exploreUntil || this.me.hp < this.me.max_hp * this.T.crateHuntHp) return null
+    let best: number[] | null = null
+    let bd = this.T.crateHunt
+    for (const f of this.memFarm.values()) {
+      if (f.kind !== "crate") continue
+      const d = hyp2(this.px, this.py, f.pos[0], f.pos[1])
+      if (d < bd && d > 25 && this.inSafeZone(f.pos[0], f.pos[1], 12)) {
+        bd = d
+        best = [f.pos[0], f.pos[1]]
+      }
+    }
+    if (best) this.dbg.push("cratehunt")
     return best
   }
 
